@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -864,6 +865,171 @@ func TestWaitReportsConvergence(t *testing.T) {
 	}
 	if app.DoSync(func(*cordis.Context) {}) {
 		t.Fatal("DoSync must report false once the scheduler is stopped")
+	}
+}
+
+// 压力：多个外部 goroutine 并发混合调用 Do（异步）与 DoSync（阻塞），
+// 校验三条不变量：
+//  1. 任务不丢失、不重复——执行数恰等于投递数；
+//  2. 调度器严格串行——任一时刻在飞任务数为 1（免锁模型的前提）；
+//  3. DoSync 在调度器存活期间一律报告已执行。
+//
+// 该用例是 -race 的主要用武之地：调度器内部队列由互斥量保护，
+// 任何遗漏的同步都会在此暴露。
+func TestConcurrentExternalCalls(t *testing.T) {
+	const (
+		goroutines   = 8
+		perGoroutine = 50
+		total        = goroutines * perGoroutine
+	)
+
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var executed, syncOK, inFlight, maxDepth atomic.Int64
+	task := func(*cordis.Context) {
+		cur := inFlight.Add(1)
+		for {
+			old := maxDepth.Load()
+			if cur <= old || maxDepth.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		executed.Add(1)
+		inFlight.Add(-1)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				if i%2 == 0 {
+					h.app.Do(task)
+					continue
+				}
+				if h.app.DoSync(task) {
+					syncOK.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if !h.app.Wait() {
+		t.Fatal("system did not converge")
+	}
+	if got := executed.Load(); got != total {
+		t.Fatalf("executed %d tasks, want %d (tasks lost or duplicated)", got, total)
+	}
+	if got, want := syncOK.Load(), int64(total/2); got != want {
+		t.Fatalf("DoSync reported success %d times, want %d", got, want)
+	}
+	if got := maxDepth.Load(); got != 1 {
+		t.Fatalf("scheduler must run tasks serially, observed %d concurrent tasks", got)
+	}
+}
+
+// 压力：外部 goroutine 并发注册组件。注册表写入与 fiber 装载
+// 全部经调度器串行化，最终每个实例都必须完成加载且无遗漏。
+func TestConcurrentPluginRegistration(t *testing.T) {
+	const (
+		goroutines   = 8
+		perGoroutine = 20
+	)
+
+	h := newHarness(t)
+	defer h.app.Close()
+
+	registered := make([][]*cordis.Fiber, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			fs := make([]*cordis.Fiber, 0, perGoroutine)
+			for i := 0; i < perGoroutine; i++ {
+				p := &cordis.Plugin{
+					Name:  fmt.Sprintf("g%d-p%d", g, i),
+					Apply: func(*cordis.Context, any) error { return nil },
+				}
+				var f *cordis.Fiber
+				var err error
+				if !h.app.DoSync(func(ctx *cordis.Context) {
+					f, err = ctx.Plugin(p, nil)
+				}) {
+					t.Errorf("scheduler stopped during registration")
+					return
+				}
+				if err != nil {
+					t.Errorf("plugin g%d-p%d: %v", g, i, err)
+					return
+				}
+				fs = append(fs, f)
+			}
+			registered[g] = fs
+		}(g)
+	}
+	wg.Wait()
+
+	if !h.app.Wait() {
+		t.Fatal("system did not converge")
+	}
+	count := 0
+	for _, fs := range registered {
+		for _, f := range fs {
+			if f == nil {
+				t.Fatal("registration returned a nil fiber")
+			}
+			if s := f.State(); s != cordis.StateActive {
+				t.Fatalf("concurrently registered fiber should be active, got %s", s)
+			}
+			count++
+		}
+	}
+	if want := goroutines * perGoroutine; count != want {
+		t.Fatalf("registered %d fibers, want %d", count, want)
+	}
+}
+
+// 压力：Close 与外部投递并发。封闭投递口后到达的任务被丢弃
+// （设计如此，见 scheduler.post），但整个过程不得 panic 或死锁；
+// Close 必须保持幂等。
+func TestConcurrentCloseWithPosts(t *testing.T) {
+	app := cordis.New()
+
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				app.Do(func(*cordis.Context) {})
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		app.Close()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock: Close racing with external posts")
+	}
+
+	// 幂等：调度器已停止，重复 Close 不得 panic 或阻塞。
+	app.Close()
+	if app.DoSync(func(*cordis.Context) {}) {
+		t.Fatal("DoSync must report false after Close")
 	}
 }
 
