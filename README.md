@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/metaRobin/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/metaRobin/cordis/actions/workflows/ci.yml)
 
-> 论文《Spatiotemporal Composability》所提出的**时空可组合组件模型**的纯 Go 实现。
+> 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
 > 零第三方依赖 · 单 goroutine 免锁运行时 · 39 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
@@ -393,8 +393,8 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 
 ## 11. 参考
 
-- 论文《Spatiotemporal Composability》—— 时空可组合组件模型的理论来源
-- 官方 TypeScript 实现 —— 本仓库逐模块对照的语义基准（概念映射见 §2）
+- **论文**：[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)（arXiv:2608.25512 · [DOI](https://doi.org/10.48550/arXiv.2608.25512)，北京大学 & DeepSeek-AI 联合署名，2026-08-26）—— 时空可组合组件模型的理论来源；论文源文件见 [cordiverse/paper](https://github.com/cordiverse/paper)
+- **官方 TypeScript 实现**：[cordiverse/cordis](https://github.com/cordiverse/cordis)（npm [`cordis`](https://www.npmjs.com/package/cordis)，MIT）—— 本仓库逐模块对照的语义基准（概念映射见 §2）
 - 包级设计说明见 `cordis.go` 顶部注释；各模块内部设计取舍见对应源文件注释
 
 ---
