@@ -3,7 +3,7 @@
 [![CI](https://github.com/metaRobin/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/metaRobin/cordis/actions/workflows/ci.yml)
 
 > 论文《Spatiotemporal Composability》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 35 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 39 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -68,16 +68,17 @@ flowchart TD
 | `cordis.go` | 93 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
 | `app.go` | 225 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
 | `context.go` | 203 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
-| `fiber.go` | 560 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、配置热更新 |
+| `fiber.go` | 561 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、配置热更新 |
 | `reflect.go` | 241 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
-| `registry.go` | 191 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
+| `registry.go` | 193 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
 | `events.go` | 189 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel`）与 `Logger` |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
 | `loader.go` | 788 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 912 | 核心运行时测试（19 项 + 2 基准） |
+| `cordis_test.go` | 1078 | 核心运行时测试（22 项 + 1 基准） |
 | `loader_test.go` | 707 | 声明式配置层测试（15 项 + 1 基准） |
 | `index_internal_test.go` | 60 | 依赖倒排索引的生命周期不变量（白盒） |
+| `disposable_internal_test.go` | 125 | 墓碑压缩的不变量与基准（1 项 + 3 基准，白盒） |
 
 ---
 
@@ -87,7 +88,7 @@ flowchart TD
 git clone git@github-metaRobin:metaRobin/cordis.git
 cd cordis
 
-go test ./...          # 35 项测试
+go test ./...          # 39 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -326,11 +327,11 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **35 项全部通过**；`go test -race ./...` 无竞态报告；另有 2 个基准（`-bench .`）。
+`go test ./...` → **39 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
-**核心运行时（`cordis_test.go`，19 项）**
+**核心运行时（`cordis_test.go`，22 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -351,6 +352,9 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestDisposePanicLogged` | 撤销 panic 被记录且不阻断后续 |
 | `TestWaitReportsConvergence` | `Wait` / `DoSync` 的收敛与执行结果上报 |
 | `TestSchedulerUnboundedQueue` | 单任务内超量投递不自死锁 |
+| `TestConcurrentExternalCalls` | 8 goroutine 混合 `Do`/`DoSync`：任务不丢失不重复、调度严格串行、执行结果如实上报 |
+| `TestConcurrentPluginRegistration` | 并发注册 160 个实例，全部收敛为 `active` |
+| `TestConcurrentCloseWithPosts` | `Close` 与外部投递并发：无死锁、无 panic、幂等 |
 
 **声明式配置层（`loader_test.go`，15 项）**
 
@@ -369,9 +373,21 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 
 `TestReflectIndexLifecycle` —— 依赖倒排索引的 track/untrack 严格配对（注销、未注册失败路径与 `Close` 级联后索引回空）
 
+**内部不变量（`disposable_internal_test.go`，1 项，白盒）**
+
+`TestDisposableCompactionPreservesOrder` —— 墓碑压缩确实触发（`order > 8` 且 `order > 2×存活数`），且按 `id` 排序重建后 LIFO 序不破
+
 **基准**
 
-`BenchmarkServiceNotify`（服务上下线通知代价，倒排索引前后对比见提交历史）· `BenchmarkLoaderLoad`（声明式协调吞吐）
+| 基准 | 度量对象 |
+| --- | --- |
+| `BenchmarkServiceNotify` | 服务上下线通知代价（倒排索引前后对比见提交历史） |
+| `BenchmarkLoaderLoad` | 声明式协调吞吐 |
+| `BenchmarkDisposableSteadyChurn` | 固定存活集持续更替的摊还成本（含摊入的墓碑重建） |
+| `BenchmarkDisposableCompaction` | 隔离的单次 `order` 重建（map 遍历 + 排序） |
+| `BenchmarkDisposableClear` | `clear` 成本与历史操作量的关系（压缩生效时应持平） |
+
+墓碑压缩三项基准的实测数据与判读见审查报告表 3：存活集 64× 增长时单次更替成本仅 2.2×；历史操作量 64× 增长时 `clear` 成本持平，印证 `order` 未随运行时长累积。
 
 ---
 
