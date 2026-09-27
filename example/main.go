@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	cordis "cordis"
+	cordis "github.com/metaRobin/cordis"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	cordis "cordis"
+	cordis "github.com/metaRobin/cordis"
 )
 
 // loaderHarness loader 测试脚手架：内置插件目录 + 变更日志。

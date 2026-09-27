@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 39 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 44 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -91,7 +91,7 @@ Three layers, matching the diagram:
 git clone git@github-metaRobin:metaRobin/cordis.git
 cd cordis
 
-go test ./...          # 39 tests
+go test ./...          # 44 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -99,20 +99,32 @@ go run ./example       # end-to-end demo
 
 ### Using as a Dependency
 
-The module path in `go.mod` is the bare name `cordis` (not a domain path), so a local reference needs an explicit `replace`:
-
-```
-// your go.mod
-require cordis v0.0.0
-
-replace cordis => ../cordis
+```sh
+go get github.com/metaRobin/cordis
 ```
 
 ```go
-import cordis "cordis"
+import cordis "github.com/metaRobin/cordis"
 ```
 
-> To `go get` it directly, change `module` in `go.mod` to a full path (e.g. `github.com/metaRobin/cordis`) and update the import in `example/main.go` accordingly.
+To hack on cordis alongside a project that depends on it, use a Go workspace
+instead of a `replace` directive — `replace` is ignored when your module is used
+as a dependency, and a local one also breaks `go install`. Put this in a `go.work`
+**above both checkouts**, outside either repository:
+
+```
+// go.work
+go 1.22
+
+use (
+    ./cordis
+    ./your-project
+)
+```
+
+The module path is a full domain path precisely so that this works: a bare module
+name (e.g. `cordis`) cannot be resolved by the module proxy at all
+(`malformed module path "cordis": missing dot in first path element`).
 
 ---
 
@@ -330,7 +342,7 @@ stateDiagram-v2
 
 ## 10. Test Coverage
 
-`go test ./...` → **39 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **44 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 

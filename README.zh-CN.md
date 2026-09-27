@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 39 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 44 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -91,7 +91,7 @@ flowchart TD
 git clone git@github-metaRobin:metaRobin/cordis.git
 cd cordis
 
-go test ./...          # 39 项测试
+go test ./...          # 44 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -99,20 +99,30 @@ go run ./example       # 端到端示例，打印各入口状态
 
 ### 作为依赖使用
 
-`go.mod` 中模块路径为裸名 `cordis`（非域名路径），本地引用需显式 `replace`：
-
-```
-// 你的项目 go.mod
-require cordis v0.0.0
-
-replace cordis => ../cordis
+```sh
+go get github.com/metaRobin/cordis
 ```
 
 ```go
-import cordis "cordis"
+import cordis "github.com/metaRobin/cordis"
 ```
 
-> 若需直接 `go get`，把 `go.mod` 的 `module` 改为完整路径（如 `github.com/metaRobin/cordis`）并同步修正 `example/main.go` 的 import。
+若要在本地与依赖它的项目一起改 cordis，用 Go workspace 而不是 `replace` 指令——
+`replace` 在你的模块被当作依赖时会**被忽略**，而且本地的 `replace` 还会弄坏 `go install`。
+在**两个检出目录之上**、不属于任何一个仓库的位置放一个 `go.work`：
+
+```
+// go.work
+go 1.22
+
+use (
+    ./cordis
+    ./your-project
+)
+```
+
+模块路径用完整域名路径，正是为了让上面这个做法成立：裸模块名（如 `cordis`）根本
+无法被模块代理解析（`malformed module path "cordis": missing dot in first path element`）。
 
 ---
 
@@ -330,7 +340,7 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **39 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **44 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
