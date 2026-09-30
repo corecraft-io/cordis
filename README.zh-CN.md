@@ -415,7 +415,7 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 本项目采用 [Apache License 2.0](LICENSE) 授权，全文见仓库根目录 `LICENSE`。
 
 ```
-Copyright 2026 metaRobin
+Copyright 2026 corecraft-io
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

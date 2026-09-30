@@ -417,7 +417,7 @@ Measured numbers for the three compaction benchmarks, with interpretation, are i
 This project is licensed under the [Apache License 2.0](LICENSE); the full text is in `LICENSE` at the repository root.
 
 ```
-Copyright 2026 metaRobin
+Copyright 2026 corecraft-io
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
