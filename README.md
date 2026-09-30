@@ -1,6 +1,6 @@
 # Cordis (Go)
 
-[![CI](https://github.com/metaRobin/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/metaRobin/cordis/actions/workflows/ci.yml)
+[![CI](https://github.com/corecraft-io/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/corecraft-io/cordis/actions/workflows/ci.yml)
 
 **English** · [中文](README.zh-CN.md)
 
@@ -88,7 +88,7 @@ Three layers, matching the diagram:
 ## 4. Quick Start
 
 ```bash
-git clone git@github-metaRobin:metaRobin/cordis.git
+git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
 go test ./...          # 44 tests
@@ -100,11 +100,11 @@ go run ./example       # end-to-end demo
 ### Using as a Dependency
 
 ```sh
-go get github.com/metaRobin/cordis
+go get github.com/corecraft-io/cordis
 ```
 
 ```go
-import cordis "github.com/metaRobin/cordis"
+import cordis "github.com/corecraft-io/cordis"
 ```
 
 To hack on cordis alongside a project that depends on it, use a Go workspace

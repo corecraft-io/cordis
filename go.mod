@@ -1,3 +1,3 @@
-module github.com/metaRobin/cordis
+module github.com/corecraft-io/cordis
 
 go 1.22

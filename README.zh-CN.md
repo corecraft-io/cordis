@@ -1,6 +1,6 @@
 # Cordis (Go)
 
-[![CI](https://github.com/metaRobin/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/metaRobin/cordis/actions/workflows/ci.yml)
+[![CI](https://github.com/corecraft-io/cordis/actions/workflows/ci.yml/badge.svg)](https://github.com/corecraft-io/cordis/actions/workflows/ci.yml)
 
 [English](README.md) · **中文**
 
@@ -88,7 +88,7 @@ flowchart TD
 ## 4. 快速开始
 
 ```bash
-git clone git@github-metaRobin:metaRobin/cordis.git
+git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
 go test ./...          # 44 项测试
@@ -100,11 +100,11 @@ go run ./example       # 端到端示例，打印各入口状态
 ### 作为依赖使用
 
 ```sh
-go get github.com/metaRobin/cordis
+go get github.com/corecraft-io/cordis
 ```
 
 ```go
-import cordis "github.com/metaRobin/cordis"
+import cordis "github.com/corecraft-io/cordis"
 ```
 
 若要在本地与依赖它的项目一起改 cordis，用 Go workspace 而不是 `replace` 指令——

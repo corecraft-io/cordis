@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	cordis "github.com/metaRobin/cordis"
+	cordis "github.com/corecraft-io/cordis"
 )
 
 // harness 测试脚手架：所有场景在调度器上下文中执行，

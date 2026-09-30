@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	cordis "github.com/metaRobin/cordis"
+	cordis "github.com/corecraft-io/cordis"
 )
 
 func main() {
