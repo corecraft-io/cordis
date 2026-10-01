@@ -75,6 +75,9 @@ var (
 	// ErrServiceDuplicate 同一隔离域内重复注册同名服务。
 	ErrServiceDuplicate = errors.New("cordis: duplicate service registration")
 	// ErrServiceNotFound 请求的服务在当前隔离域中不可见。
+	// ErrServiceNotSet 写入服务未成立（当前 Fiber 未注册该服务，
+	// 或 internal/set 链上的监听器否决了本次写入）。
+	ErrServiceNotSet   = errors.New("cordis: service not set")
 	ErrServiceNotFound = errors.New("cordis: service not found")
 	// ErrInvalidPlugin Plugin.Apply 为 nil。
 	ErrInvalidPlugin = errors.New("cordis: invalid plugin, apply must not be nil")

@@ -1,5 +1,7 @@
 package cordis
 
+import "fmt"
+
 // Context 是统一上下文（论文 §3.3 的 unified context）：
 // 既承载效果追踪（通过 fiber），也承载协效应解析（通过 isolate/intercept 链）。
 //
@@ -167,7 +169,38 @@ func mergeIntercept(far, near any) any {
 	return out
 }
 
-// Get 解析服务 name：从当前 Fiber 沿父链向上查找最近的可访问实现。
+// Get 解析服务 name。
+//
+// 分发 internal/get 洋葱链（仅在有人监听时）：监听器可直接给出值，
+// 或调用 next 拿到链尾的解析结果（ServiceLookup）。链尾即下面的
+// lookup——沿 Fiber 父链向上查找最近的可访问实现。
+func (c *Context) Get(name string) (any, bool) {
+	e := c.app.root.events
+	if len(e.hooks["internal/get"]) == 0 {
+		return c.lookup(name)
+	}
+	result := c.Waterfall("internal/get", func() any {
+		v, ok := c.lookup(name)
+		return ServiceLookup{Value: v, OK: ok}
+	}, name)
+	switch got := result.(type) {
+	case ServiceLookup:
+		return got.Value, got.OK
+	case nil:
+		return nil, false
+	default:
+		// 监听器直接给出了值：视为命中。
+		return got, true
+	}
+}
+
+// ServiceLookup 是 internal/get 链尾的解析结果。
+type ServiceLookup struct {
+	Value any
+	OK    bool
+}
+
+// lookup 解析服务 name：从当前 Fiber 沿父链向上查找最近的可访问实现。
 // 域校验：仅接受注册域键与调用方一致的服务实现；跨越 fiber 边界
 // 时还要求父上下文的域键不变——同名服务在不同域中互不可见。
 //
@@ -179,7 +212,7 @@ func mergeIntercept(far, near any) any {
 //
 // 找不到时返回 (nil, false)，不区分「未注册」与「注册者未激活」——
 // 两者对依赖者而言都意味着依赖未满足。
-func (c *Context) Get(name string) (any, bool) {
+func (c *Context) lookup(name string) (any, bool) {
 	key := c.isolateKey(name)
 	f := c.fiber
 	for {
@@ -240,6 +273,21 @@ func (c *Context) Emit(name string, args ...any) {
 	c.app.root.events.Emit(c, name, args...)
 }
 
+// Serial 串行分发；首个非 nil 的返回值终止分发（见 Events.Serial）。
+func (c *Context) Serial(name string, args ...any) any {
+	return c.app.root.events.Serial(c, name, args...)
+}
+
+// Bail 同 Serial，但同步抛出 panic（见 Events.Bail）。
+func (c *Context) Bail(name string, args ...any) any {
+	return c.app.root.events.Bail(c, name, args...)
+}
+
+// Parallel 分发并聚合全部错误（见 Events.Parallel）。
+func (c *Context) Parallel(name string, args ...any) error {
+	return c.app.root.events.Parallel(c, name, args...)
+}
+
 // Waterfall 洋葱式分发事件（见 Events.Waterfall）：terminal 是链尾
 // 的默认行为，监听器不调用 next 即终止分发。
 func (c *Context) Waterfall(name string, terminal func() any, args ...any) any {
@@ -264,6 +312,20 @@ func (c *Context) Provide(name string, value any, check func() bool) (Dispose, e
 }
 
 // Set 更新当前 Fiber 注册的服务值。
+//
+// 分发 internal/set 洋葱链（仅在有人监听时）：监听器返回 bool 表示
+// 这次写入是否成立（false → 返回 ErrServiceNotSet），调用 next 则交给
+// 链尾的 Reflect.Set。
 func (c *Context) Set(name string, value any) error {
-	return c.app.root.reflect.Set(c, name, value)
+	e := c.app.root.events
+	if len(e.hooks["internal/set"]) == 0 {
+		return c.app.root.reflect.Set(c, name, value)
+	}
+	result := c.Waterfall("internal/set", func() any {
+		return c.app.root.reflect.Set(c, name, value) == nil
+	}, name, value)
+	if ok, isBool := result.(bool); !isBool || !ok {
+		return fmt.Errorf("%w: %q", ErrServiceNotSet, name)
+	}
+	return nil
 }

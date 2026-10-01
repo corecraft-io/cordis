@@ -1844,6 +1844,130 @@ func TestRegistryIteration(t *testing.T) {
 	})
 }
 
+// TestInternalDispatchObserver internal/dispatch 观测每一次分发：
+// mode（emit/serial/bail/parallel/waterfall）、事件名、载荷、分发方上下文；
+// 且 internal/* 事件自身不再触发它（避免观测者把自己卷进递归）。
+func TestInternalDispatchObserver(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var seen []string
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/dispatch", func(_ *cordis.Context, args ...any) any {
+			mode := args[0].(string)
+			name := args[1].(string)
+			seen = append(seen, mode+"/"+name)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	h.run(func(ctx *cordis.Context) {
+		// 五种模式各发一次（监听器都是空的，只为观测）。
+		ctx.Emit("demo/emit", 1)
+		_ = ctx.Serial("demo/serial", 2)
+		_ = ctx.Bail("demo/bail", 3)
+		_ = ctx.Parallel("demo/parallel", 4)
+		_ = ctx.Waterfall("demo/waterfall", func() any { return nil }, 5)
+		// internal/* 事件不得被观测（否则会递归）。
+		ctx.Emit("internal/never", 6)
+	})
+	want := []string{
+		"emit/demo/emit",
+		"serial/demo/serial",
+		"bail/demo/bail",
+		"parallel/demo/parallel",
+		"waterfall/demo/waterfall",
+	}
+	if fmt.Sprint(seen) != fmt.Sprint(want) {
+		t.Fatalf("observed dispatches: %v, want %v", seen, want)
+	}
+}
+
+// TestServiceReadWriteInterception internal/get 与 internal/set：
+// 监听器既能改写读到的值，也能否决一次写入；不监听时零额外开销
+// （实现上是"桶为空就直接走原路径"）。
+func TestServiceReadWriteInterception(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Provide("db", "real", nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// 未注册监听器：走原路径。
+	h.run(func(ctx *cordis.Context) {
+		if v, ok := ctx.Get("db"); !ok || v != "real" {
+			t.Fatalf("plain Get: %v %v", v, ok)
+		}
+		if _, missing := ctx.Get("nope"); missing {
+			t.Fatal("missing service must be reported as absent")
+		}
+	})
+
+	// internal/get：改写读到的值；也可返回 ServiceLookup 表达"未命中"。
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/get", func(_ *cordis.Context, args ...any) any {
+			name := args[0].(string)
+			next := args[len(args)-1].(func() any)
+			if name == "db" {
+				return "intercepted" // 直接给值，跳过链尾
+			}
+			if name == "nope" {
+				_ = next() // 走链尾，结果仍是未命中
+				return cordis.ServiceLookup{OK: false}
+			}
+			return next()
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	h.run(func(ctx *cordis.Context) {
+		if v, ok := ctx.Get("db"); !ok || v != "intercepted" {
+			t.Fatalf("intercepted Get: %v %v", v, ok)
+		}
+		if v, ok := ctx.Get("nope"); ok || v != nil {
+			t.Fatalf("lookup override: %v %v", v, ok)
+		}
+		// GetMust 建立在 Get 之上：改写后命中即不 panic。
+		if got := ctx.GetMust("db"); got != "intercepted" {
+			t.Fatalf("GetMust: %v", got)
+		}
+	})
+
+	// internal/set：监听器可放行（调用 next）也可否决（返回 false）。
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/set", func(_ *cordis.Context, args ...any) any {
+			value := args[1].(any)
+			next := args[len(args)-1].(func() any)
+			if value == "forbidden" {
+				return false
+			}
+			return next()
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	h.run(func(ctx *cordis.Context) {
+		if err := ctx.Set("db", "allowed"); err != nil {
+			t.Fatal(err)
+		}
+		if v, _ := ctx.Get("db"); v != "intercepted" && v != "real" && v != "allowed" {
+			t.Fatalf("after Set: %v", v)
+		}
+		err := ctx.Set("db", "forbidden")
+		if !errors.Is(err, cordis.ErrServiceNotSet) {
+			t.Fatalf("vetoed Set: %v, want ErrServiceNotSet", err)
+		}
+		// 未注册服务的写入同样经链尾判定。
+		if err := ctx.Set("missing", 1); !errors.Is(err, cordis.ErrServiceNotSet) {
+			t.Fatalf("Set on unregistered service: %v", err)
+		}
+	})
+}
+
 // BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明
 // 该依赖的 Fiber 在场时，单次 provide/dispose 的耗时。
 // 引入倒排索引前该路径逐 fiber 全量扫描（O(全部 Fiber)）。

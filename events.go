@@ -2,6 +2,7 @@ package cordis
 
 import (
 	"fmt"
+	"strings"
 )
 
 // Logger 见 logger.go：日志服务由根上下文持有（`App.Logger()`），
@@ -145,8 +146,26 @@ func (e *Events) hooksOf(name string, filter func(hookCtx *Context) bool) []*hoo
 	return out
 }
 
+// observe 观测一次分发：mode / 事件名 / 载荷 / 分发方上下文。
+//
+// 两个刻意的设计（与官方实现的 _resolve 同款）：一是**无人监听时
+// 直接返回**（否则每次分发都要多一次开销）；二是 internal/* 事件
+// 自身不再触发它，避免观测者把自己卷进无限递归。
+func (e *Events) observe(ctx *Context, mode, name string, args []any) {
+	if len(e.hooks["internal/dispatch"]) == 0 {
+		return
+	}
+	if strings.HasPrefix(name, "internal/") {
+		return
+	}
+	for _, h := range e.hooksOf("internal/dispatch", nil) {
+		e.invoke(ctx, "internal/dispatch", h, []any{mode, name, args, ctx})
+	}
+}
+
 // Emit 同步分发事件，回调返回值与错误均被忽略（错误记日志）。
 func (e *Events) Emit(ctx *Context, name string, args ...any) {
+	e.observe(ctx, "emit", name, args)
 	for _, h := range e.hooksOf(name, ctx.eventFilter) {
 		e.invoke(ctx, name, h, args)
 	}
@@ -170,6 +189,7 @@ func (e *Events) invoke(ctx *Context, name string, h *hook, args []any) {
 
 // Serial 串行分发；首个返回非 nil 结果的回调终止分发并返回该结果。
 func (e *Events) Serial(ctx *Context, name string, args ...any) any {
+	e.observe(ctx, "serial", name, args)
 	for _, h := range e.hooksOf(name, ctx.eventFilter) {
 		if result, err := call(h, ctx, args); err != nil {
 			e.ctx.app.logger.Error("event %q listener error: %v", name, err)
@@ -182,6 +202,7 @@ func (e *Events) Serial(ctx *Context, name string, args ...any) any {
 
 // Bail 同 Serial，但同步执行且不吞 panic。
 func (e *Events) Bail(ctx *Context, name string, args ...any) any {
+	e.observe(ctx, "bail", name, args)
 	for _, h := range e.hooksOf(name, ctx.eventFilter) {
 		if result := h.callback(ctx, args...); result != nil {
 			return result
@@ -192,6 +213,7 @@ func (e *Events) Bail(ctx *Context, name string, args ...any) any {
 
 // Parallel 分发并聚合全部错误（单线程下等价于串行）。
 func (e *Events) Parallel(ctx *Context, name string, args ...any) error {
+	e.observe(ctx, "parallel", name, args)
 	var errs []error
 	for _, h := range e.hooksOf(name, ctx.eventFilter) {
 		if _, err := call(h, ctx, args); err != nil {
@@ -234,6 +256,7 @@ func call(h *hook, ctx *Context, args []any) (result any, err error) {
 // 静默吞掉。调度器内的调用点（Fiber.Update）会把该 panic 收敛为错误
 // 返回，不会击穿调度器 goroutine。
 func (e *Events) Waterfall(ctx *Context, name string, terminal func() any, args ...any) any {
+	e.observe(ctx, "waterfall", name, args)
 	hooks := e.hooksOf(name, ctx.eventFilter)
 	steps := make([]chainStep, len(hooks))
 	for i, h := range hooks {
