@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 75 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 76 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -51,6 +51,24 @@
 | 配置校验 | Standard Schema（`~standard.validate`） | `Plugin.Validate func(any) (any, error)` | Go 没有 Standard Schema；错误契约（结构性失败 vs 配置失败）保持一致 |
 | `@Inject` 装饰器 | 类方法装饰器 | N/A | Go 无装饰器；`Plugin.Inject` 与 `ctx.Inject` 表达同一件事 |
 | 日志消息的目标实例 | 每条 `LogMessage` 挂 `WeakRef<Fiber>` | `FiberName` + `UID` | Go 没有弱引用；在 1000 条的缓冲里持强 `*Fiber` 会把已注销实例拖住 |
+
+### 覆盖矩阵（N/A 项）
+
+官方包与测试中没有对应形态的部分（依赖 Go 不存在的语言/平台机制）：
+
+| 官方项 | 为何不适用 | 本实现用什么覆盖同一需求 |
+| --- | --- | --- |
+| `associate`（属性注入 `ctx.foo.bar`） | `Context` 不是 Proxy，没有属性访问拦截 | 按名字显式 `ctx.Get` / `ctx.Provide` |
+| `shadow` / traceable 调用者 | 服务值外没有 `this` 绑定层 | 调用方按自己的域解析；`Get` 的可见性本身按域划分 |
+| `invoke`（可调用服务） | Go 没有可调用对象 | 服务值 + 方法，按名字解析 |
+| `@Inject` 装饰器 | Go 无装饰器 | `Plugin.Inject` 与 `ctx.Inject` |
+| `accessor` / `mixin` | Proxy 的 `get`/`set` 陷阱 | 拦截配置（`Intercept` / `InterceptOf`） |
+| `loader/src/resolve.ts`（ESM 解析） | Go 无模块系统 | `NewLoader` 的解析器函数，外加 `Loader.Builtins` 处理 `cordis:<名字>` |
+| `packages/hmr`（模块热替换） | 没有可重读的模块注册表 | 热重载即 `Fiber.Update`；换定义即 `Registry.Delete` + 重新注册 |
+| `packages/timer` | 上游是独立包 | 一个普通效果即可，见 `example/main.go` 的定时器场景 |
+| `packages/logger-console`（终端着色） | 上游是独立包 | 默认 stderr 出口；着色与版式交给自定义 `Exporter` |
+| `packages/include`（配置文件 include/patch） | 上游是独立包 | 持久化由嵌入方负责；写入后调用 `Loader.NotifyConfigUpdate()` |
+| `packages/group`、`packages/create` | 脚手架 / 多应用辅助 | 运行期的一半由 `EntryGroup`（嵌套入口）承担；脚手架不在范围内 |
 | `loader/patch-context` | 监听器就地改写上下文的 isolate/intercept 表 | 用洋葱链**环绕**重建 | Go 的上下文链不可变，监听器只能观察并给重建排序，不能就地改域表 |
 
 ---
@@ -89,13 +107,13 @@ flowchart TD
 | `context.go` | 269 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
 | `fiber.go` | 643 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、局部更新钩子、配置热更新 |
 | `reflect.go` | 294 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
-| `registry.go` | 213 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
+| `registry.go` | 250 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口与遍历 API |
 | `logger.go` | 369 | 日志级别、命名日志器、出口与有界消息缓冲 |
 | `events.go` | 314 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）与监听器路由 |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
 | `loader.go` | 902 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
-| `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 1835 | 核心运行时测试（37 项 + 1 基准） |
+| `example/main.go` | 290 | 端到端示例：热重载 / 降级 / 隔离域 / 全树快照 / 日志 / 洋葱链 / 定时器效果 |
+| `cordis_test.go` | 1889 | 核心运行时测试（38 项 + 1 基准） |
 | `loader_test.go` | 887 | 声明式配置层测试（17 项 + 1 基准） |
 | `loader_events_test.go` | 283 | loader 事件面、全树快照、内置插件与日志（5 项） |
 | `logger_test.go` | 252 | 日志命名、级别过滤、出口与环形缓冲（5 项） |
@@ -112,7 +130,7 @@ flowchart TD
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 75 项测试
+go test ./...          # 76 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -418,7 +436,7 @@ stateDiagram-v2
 
 ## 9. 示例输出
 
-`go run ./example` 覆盖五个场景。
+`go run ./example` 覆盖以下场景。
 
 | 场景 | 观察点 |
 | --- | --- |
@@ -427,16 +445,20 @@ stateDiagram-v2
 | `db` 禁用 / 恢复 | `cache`、`web` 自动回到 `pending`，恢复后自动 `active` |
 | 隔离域多租户双栈 | `tenant-a` / `tenant-b` 同名服务并存互不干扰 |
 | 动态移除 `db-b` | 该栈整体降级，`tenant-a` 不受影响 |
+| 全树快照 | `Entries()` 按短 ID 稳定排序；`Wait()` 报告收敛、`Pending()` 为空 |
+| 命名日志器 | 显式名压过插件名；低于 `info` 阈值的 `debug` 不进缓冲 |
+| 洋葱式分发链 | `(21 * 2) + 1000` —— 内层翻倍、外层加、终端给基数 |
+| 定时器效果 | 旧 goroutine 先停表、新 goroutine 再启动（LIFO）；注销会等它真正退出；每次 tick 都经 `App.Do` 回到调度器 |
 
 ---
 
 ## 10. 测试覆盖
 
-`go test ./...` → **75 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **76 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
-**核心运行时（`cordis_test.go`，37 项）**
+**核心运行时（`cordis_test.go`，38 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -465,6 +487,7 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestEventPrependOrder` | `ListenOptions{Prepend: true}` 插入注册序头部 |
 | `TestEventDispatchSnapshot` | 分发在快照上进行：自注销不跳过相邻监听器，分发中登记的监听器本次不生效 |
 | `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` 可观察其它域的 `internal/service` 事件 |
+| `TestRegistryIteration` | `Values()` / `Keys()` / `ForEach()` 按注册序、随注销收缩、遍历快照 |
 | `TestUpdateEventHookScope` | 非 global 的 `internal/update` 监听器只拦本 fiber；global 的对所有 fiber 生效 |
 | `TestUpdateHookNoSaveAndVeto` | `noSave` 抵达钩子；返回 `false` 即否决配置替换与重启 |
 | `TestUpdateHookDuplicateNextIsReported` | 钩子误用 `next` 时 `Update` 返回错误而非击穿调度器 |

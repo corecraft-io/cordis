@@ -1790,6 +1790,60 @@ func TestFailedFiberDoesNotReenterOnDependencyRefresh(t *testing.T) {
 	}
 }
 
+// TestRegistryIteration 注册表的遍历接口（对齐官方 registry 的
+// values / keys / forEach）：按注册序、随注销收缩、遍历的是快照。
+func TestRegistryIteration(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	p1 := &cordis.Plugin{Name: "one", Apply: func(*cordis.Context, any) error { return nil }}
+	p2 := &cordis.Plugin{Name: "two", Apply: func(*cordis.Context, any) error { return nil }}
+
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Plugin(p1, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ctx.Plugin(p2, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	var names []string
+	h.run(func(ctx *cordis.Context) {
+		for _, rt := range ctx.Registry().Values() {
+			names = append(names, rt.Name())
+		}
+		if got := len(ctx.Registry().Keys()); got != 2 {
+			t.Fatalf("keys: %d, want 2", got)
+		}
+		if ctx.Registry().Size() != 2 {
+			t.Fatalf("size: %d", ctx.Registry().Size())
+		}
+		// Runtime.Fibers 快照只有一个成员（顺序不保证）。
+		fibers := ctx.Registry().Values()[0].Fibers()
+		if len(fibers) != 1 {
+			t.Fatalf("runtime fibers: %d", len(fibers))
+		}
+		// ForEach 遍历的是快照：回调内增删不影响本轮。
+		ctx.Registry().ForEach(func(p *cordis.Plugin, rt *cordis.Runtime) {
+			if rt.Plugin() != p {
+				t.Fatal("ForEach: plugin/runtime mismatch")
+			}
+		})
+	})
+	if fmt.Sprint(names) != fmt.Sprint([]string{"one", "two"}) {
+		t.Fatalf("registration order: %v", names)
+	}
+
+	// 注销后遍历收缩。
+	h.run(func(ctx *cordis.Context) { ctx.Registry().Delete(p1) })
+	h.run(func(ctx *cordis.Context) {
+		if got := ctx.Registry().Keys(); len(got) != 1 || got[0] != p2 {
+			t.Fatalf("keys after delete: %v", got)
+		}
+	})
+}
+
 // BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明
 // 该依赖的 Fiber 在场时，单次 provide/dispose 的耗时。
 // 引入倒排索引前该路径逐 fiber 全量扫描（O(全部 Fiber)）。

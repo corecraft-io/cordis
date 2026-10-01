@@ -10,6 +10,8 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	cordis "github.com/corecraft-io/cordis"
 )
@@ -69,10 +71,49 @@ func main() {
 		},
 	}
 
+	// ticker 演示「外部 goroutine + 显式逆操作」：周期由配置驱动，
+	// 热重载时旧 goroutine 停表之后新的才启动（LIFO 逆序回收），
+	// 卸载后其 goroutine 必然退出——逆操作要真的等到它退出。
+	// 定时器里的每次回调都经 App.Do 回到调度器，绝不直接碰运行时状态。
+	ticker := &cordis.Plugin{
+		Name: "ticker",
+		Apply: func(ctx *cordis.Context, config any) error {
+			every := config.(time.Duration)
+			ctx.Logger().Info("start ticking every %s", every)
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				t := time.NewTicker(every)
+				defer t.Stop()
+				for {
+					select {
+					case <-t.C:
+						ctx.App().Do(func(c *cordis.Context) {
+							c.Logger("tick").Info("tick")
+						})
+					case <-stop:
+						return
+					}
+				}
+			}()
+			_, err := ctx.Effect("ticker", func() (cordis.Dispose, error) {
+				return func() {
+					ctx.Logger().Info("stop ticking")
+					close(stop)
+					wg.Wait()
+				}, nil
+			})
+			return err
+		},
+	}
+
 	plugins := map[string]*cordis.Plugin{
 		"database": database,
 		"cache":    cache,
 		"web":      web,
+		"ticker":   ticker,
 	}
 
 	loader := cordis.NewLoader(app, func(name string) (*cordis.Plugin, error) {
@@ -149,6 +190,81 @@ func main() {
 	fmt.Println("\n== 动态操作：移除 tenant-b 的数据库（其栈整体降级）==")
 	loader.Remove("db-b")
 	printStates(loader, []string{"db-a", "cache-a", "web-a", "cache-b", "web-b"})
+
+	// ---------------------------------------------------------------------------
+	// 全树快照：Entries() 覆盖全部入口（含分组子入口），顺序按短 ID 稳定；
+	// Wait() 等待协调收敛（依赖未满足的 pending 也是稳定态，不会挂起）。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 全树快照 ==")
+	for _, e := range loader.Tree().Entries() {
+		fmt.Printf("   %-8s %s\n", e.Options().ID, e.Options().Name)
+	}
+	fmt.Printf("   已收敛=%v 未稳定=%d\n", loader.Wait(), len(loader.Tree().Pending()))
+
+	// ---------------------------------------------------------------------------
+	// 日志：命名日志器 + 出口 + 有界缓冲。
+	// 名字取显式参数 > logger 拦截配置 > 插件名；缓冲保留最近 N 条。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 日志：命名日志器与缓冲 ==")
+	app.Logger().SetBufferSize(64)
+	app.DoSync(func(ctx *cordis.Context) {
+		ctx.Logger("demo").Info("来自显式命名的日志器")
+		ctx.Logger().Warn("来自插件上下文的日志器（本例为 root）")
+		ctx.Logger().Debug("低于默认阈值（info），缓冲不记录")
+	})
+	for _, m := range app.Logger().Messages() {
+		fmt.Printf("   #%d [%s] %s: %s\n", m.Seq, m.Level, m.Name, m.Text)
+	}
+
+	// ---------------------------------------------------------------------------
+	// 洋葱式分发（waterfall）：监听器拿到 (args..., next)，
+	// 不调用 next 即终止整条链——本例用它把配置改写后再交给下一个环节。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 洋葱式分发：graphql 端口改写链 ==")
+	app.DoSync(func(ctx *cordis.Context) {
+		_, _ = ctx.On("demo/port", func(_ *cordis.Context, args ...any) any {
+			next := args[len(args)-1].(func() any)
+			return next().(int) + 1000 // 最外层：整体 +1000
+		}, cordis.ListenOptions{Prepend: true})
+		_, _ = ctx.On("demo/port", func(_ *cordis.Context, args ...any) any {
+			next := args[len(args)-1].(func() any)
+			return next().(int) * 2 // 内层：先翻倍
+		})
+		port := ctx.Waterfall("demo/port", func() any { return 21 }, "ignored").(int)
+		fmt.Printf("   (21 * 2) + 1000 = %d\n", port)
+	})
+
+	// ---------------------------------------------------------------------------
+	// 时间维的"外部定时器"：效果携带显式逆操作（停表 + 关闭计数），
+	// 外部 goroutine 只经 App.Do 进入调度器，绝不直接碰运行时状态。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 定时器效果：外部 goroutine 经 App.Do 进入 ==")
+	if _, err := loader.Create(cordis.EntryOptions{ID: "tick", Name: "ticker", Config: 60 * time.Millisecond}, "", -1); err != nil {
+		fmt.Println("   tick create:", err)
+	}
+	time.Sleep(180 * time.Millisecond)
+	// 热重载周期：旧 goroutine 停表之后，新 goroutine 才启动（LIFO 逆序回收）。
+	var updateErr error
+	app.DoSync(func(*cordis.Context) {
+		e, err := loader.Tree().Resolve("tick")
+		if err != nil {
+			updateErr = err
+			return
+		}
+		updateErr = e.Fiber().Update(30 * time.Millisecond)
+	})
+	if updateErr != nil {
+		fmt.Println("   tick update:", updateErr)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if err := loader.Remove("tick"); err != nil {
+		fmt.Println("   tick remove:", err)
+	}
+	fmt.Println("   定时器已注销：其 goroutine 随之退出")
 
 	// ---------------------------------------------------------------------------
 	// 关闭：沿效果链级联回收——全部组件按依赖逆序完全还原环境。

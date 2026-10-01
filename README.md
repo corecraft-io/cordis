@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 75 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 76 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -51,6 +51,24 @@ Places where this implementation knowingly does **not** mirror the official one,
 | config validation | Standard Schema (`~standard.validate`) | `Plugin.Validate func(any) (any, error)` | no Standard Schema in Go; the error contract (structural vs config failure) is preserved |
 | `@Inject` decorator | class method decorator | N/A | Go has no decorators; `Plugin.Inject` and `ctx.Inject` express the same thing |
 | log message target | `WeakRef<Fiber>` on every `LogMessage` | `FiberName` + `UID` | Go has no weak references; keeping a strong `*Fiber` in a 1000-entry buffer would retain torn-down instances |
+
+### Coverage Matrix (Not Applicable)
+
+Upstream packages and suites that have no counterpart here, because the mechanism they rely on does not exist in Go:
+
+| Upstream item | Why it does not apply | What covers the need instead |
+| --- | --- | --- |
+| `associate` suite (property injection, `ctx.foo.bar`) | `Context` is not a Proxy; there is no property-access interception | `ctx.Get` / `ctx.Provide` with explicit names |
+| `shadow` / traceable caller | no `this`-bound receivers around service values | the caller resolves its own realm; `Get` visibility is realm-scoped |
+| `invoke` (callable services) | no callable objects | a service value plus a method, resolved by name |
+| `@Inject` decorator | Go has no decorators | `Plugin.Inject` and `ctx.Inject` |
+| `accessor` / `mixin` | Proxy `get`/`set` traps | intercept config (`Intercept` / `InterceptOf`) |
+| `packages/loader/src/resolve.ts` (ESM resolution) | no module system in Go | `NewLoader`'s resolver function, plus `Loader.Builtins` for `cordis:<name>` |
+| `packages/hmr` (module hot replacement) | no module registry to re-read | reloading is a `Fiber.Update`; replacing a definition is `Registry.Delete` + re-register |
+| `packages/timer` | a separate package upstream | an ordinary effect — see the timer scenario in `example/main.go` |
+| `packages/logger-console` (coloured terminal output) | a separate package upstream | the default stderr exporter; colour and layout belong in a custom `Exporter` |
+| `packages/include` (config file include/patch) | a separate package upstream | persistence lives with the embedder; `Loader.NotifyConfigUpdate()` fires after a write |
+| `packages/group`, `packages/create` | scaffolding / multi-app helpers | `EntryGroup` (nested entries) covers the runtime half; scaffolding is out of scope |
 | `loader/patch-context` | listeners mutate the context's isolate/intercept tables in place | a waterfall that **wraps** the rebuild | Go's context chain is immutable, so a listener observes and orders the rebuild instead of rewriting its realm tables |
 
 ---
@@ -89,13 +107,13 @@ Three layers, matching the diagram:
 | `context.go` | 269 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
 | `fiber.go` | 643 | State machine, epoch chasing, effects and LIFO disposal, local update hooks, hot config update |
 | `reflect.go` | 294 | Coeffect store, realm key resolution, reverse dependency index and notifications |
-| `registry.go` | 213 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points |
+| `registry.go` | 250 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points, iteration API |
 | `logger.go` | 369 | Log levels, named loggers, exporters and the bounded message buffer |
 | `events.go` | 314 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`) and listener routing |
 | `disposable.go` | 72 | Two-phase dispose steps and the order-preserving list |
 | `loader.go` | 902 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
-| `example/main.go` | 174 | End-to-end example covering hot reload, degradation and isolation |
-| `cordis_test.go` | 1835 | Core runtime tests (37 + 1 benchmark) |
+| `example/main.go` | 290 | End-to-end example: hot reload, degradation, isolation, tree snapshots, logging, waterfall chain, timer effect |
+| `cordis_test.go` | 1889 | Core runtime tests (38 + 1 benchmark) |
 | `loader_test.go` | 887 | Loader tests (17 + 1 benchmark) |
 | `loader_events_test.go` | 283 | Loader event surface, tree snapshots, builtins and logs (5) |
 | `logger_test.go` | 252 | Logger naming, level filtering, exporters and buffer (5) |
@@ -112,7 +130,7 @@ Three layers, matching the diagram:
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 75 tests
+go test ./...          # 76 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -421,7 +439,7 @@ stateDiagram-v2
 
 ## 9. Example Output
 
-`go run ./example` covers five scenarios.
+`go run ./example` covers these scenarios.
 
 | Scenario | What to watch |
 | --- | --- |
@@ -430,16 +448,20 @@ stateDiagram-v2
 | `db` disable and restore | `cache` and `web` return to `pending`, then come back automatically |
 | two-tenant stacks | `tenant-a` / `tenant-b` same-named services coexist without interference |
 | removing `db-b` | That stack degrades while `tenant-a` is unaffected |
+| whole-tree snapshot | `Entries()` in stable short-id order; `Wait()` reports convergence and `Pending()` is empty |
+| named loggers | an explicit name beats the plugin-derived one; a `debug` line below the `info` threshold never reaches the buffer |
+| waterfall chain | `(21 * 2) + 1000` — the inner listener doubles, the outer one adds, the terminal supplies the base |
+| timer effect | the old goroutine stops before the new one starts (LIFO), unloading waits for it to exit, and every tick re-enters through `App.Do` |
 
 ---
 
 ## 10. Test Coverage
 
-`go test ./...` → **75 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **76 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 
-**Core runtime (`cordis_test.go`, 37 tests)**
+**Core runtime (`cordis_test.go`, 38 tests)**
 
 | Test | Coverage |
 | --- | --- |
@@ -468,6 +490,7 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestEventPrependOrder` | `ListenOptions{Prepend: true}` inserts at the head |
 | `TestEventDispatchSnapshot` | dispatch runs on a snapshot: self-unregistering listeners cannot skip neighbours, late registrations miss the current dispatch |
 | `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` sees other realms' `internal/service` events |
+| `TestRegistryIteration` | `Values()` / `Keys()` / `ForEach()` follow registration order, shrink on delete, and iterate a snapshot |
 | `TestUpdateEventHookScope` | a non-global `internal/update` listener only intercepts its own fiber; global ones see every fiber |
 | `TestUpdateHookNoSaveAndVeto` | `noSave` reaches hooks; returning `false` vetoes config replacement and restart |
 | `TestUpdateHookDuplicateNextIsReported` | a hook misusing `next` yields an error from `Update` instead of killing the scheduler |

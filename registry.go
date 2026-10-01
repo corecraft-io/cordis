@@ -16,6 +16,23 @@ type Runtime struct {
 	index map[*Fiber]int
 }
 
+// Plugin 返回该 Runtime 对应的插件定义。
+func (rt *Runtime) Plugin() *Plugin { return rt.plugin }
+
+// Name 返回插件名（官方实现 Runtime.name 的同义访问）。
+func (rt *Runtime) Name() string {
+	if rt.plugin == nil {
+		return ""
+	}
+	return rt.plugin.Name
+}
+
+// Fibers 返回当前实例的快照。顺序**不是**注册序：remove 采用与末尾
+// 交换的 O(1) 删除（见 remove 注释），读者只应关心成员而非次序。
+func (rt *Runtime) Fibers() []*Fiber {
+	return append([]*Fiber(nil), rt.fibers...)
+}
+
 func (rt *Runtime) add(f *Fiber) func() {
 	if rt.index == nil {
 		rt.index = make(map[*Fiber]int, len(rt.fibers)+1)
@@ -77,6 +94,26 @@ func (r *Registry) Get(p *Plugin) *Runtime { return r.runtimes[p] }
 // Runtimes 按注册序返回全部 Runtime。
 func (r *Registry) Runtimes() []*Runtime {
 	return append([]*Runtime(nil), r.order...)
+}
+
+// Values 等价于 Runtimes()，与官方实现 `registry.values()` 同名。
+func (r *Registry) Values() []*Runtime { return r.Runtimes() }
+
+// Keys 按注册序返回全部已注册插件（官方 `registry.keys()` 的同义访问）。
+func (r *Registry) Keys() []*Plugin {
+	out := make([]*Plugin, 0, len(r.order))
+	for _, rt := range r.order {
+		out = append(out, rt.plugin)
+	}
+	return out
+}
+
+// ForEach 按注册序遍历全部插件及其 Runtime（官方 `registry.forEach`）。
+// 回调内不得增删注册表——遍历的是快照，修改会在下一轮才可见。
+func (r *Registry) ForEach(fn func(p *Plugin, rt *Runtime)) {
+	for _, rt := range r.Runtimes() {
+		fn(rt.plugin, rt)
+	}
 }
 
 func resolveConfig(p *Plugin, config any) (any, error) {
