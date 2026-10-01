@@ -322,6 +322,21 @@ func TestLoaderNestedRealms(t *testing.T) {
 	if fmt.Sprint(seen) != fmt.Sprint([]any{"A", "B"}) {
 		t.Fatalf("nested realms: %v", seen)
 	}
+
+	// Entry.Context() 暴露入口自己的上下文（官方 entry.context）：
+	// 继承分组域的子入口在其上下文里应能直接解析到该域的服务。
+	inherit, err := h.loader.Tree().Resolve("g:inherit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherit.Context() == nil {
+		t.Fatal("Entry.Context() must be available once loaded")
+	}
+	// 入口上下文携带入口自身引用（分组插件正是靠 ctx.Entry() 找回自己的入口）；
+	// 依赖的解析则发生在实例的 fiber 上，不在入口上下文里。
+	if inherit.Context().Entry() != inherit {
+		t.Fatal("entry context must carry its own entry")
+	}
 	priv, err := h.loader.Tree().Resolve("g:private")
 	if err != nil {
 		t.Fatal(err)

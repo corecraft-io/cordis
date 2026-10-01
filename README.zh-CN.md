@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 89 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 91 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -118,7 +118,7 @@ flowchart TD
 | `events.go` | 337 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）与监听器路由 |
 | `disposable.go` | 92 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
 | `loader.go` | 970 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
-| `example/main.go` | 290 | 端到端示例：热重载 / 降级 / 隔离域 / 全树快照 / 日志 / 洋葱链 / 定时器效果 |
+| `example/main.go` | 333 | 端到端示例：热重载 / 降级 / 隔离域 / 全树快照 / 日志 / 洋葱链 / 定时器 / 配置插值 / 效果自省 |
 | `cordis_test.go` | 2171 | 核心运行时测试（43 项 + 1 基准） |
 | `alignment_suite_test.go` | 201 | 移植的官方用例：并发更新、嵌套插件、提交读写规则（3 项） |
 | `loader_test.go` | 887 | 声明式配置层测试（17 项 + 1 基准） |
@@ -138,7 +138,7 @@ flowchart TD
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 89 项测试
+go test ./...          # 91 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -468,16 +468,20 @@ stateDiagram-v2
 | 命名日志器 | 显式名压过插件名；低于 `info` 阈值的 `debug` 不进缓冲 |
 | 洋葱式分发链 | `(21 * 2) + 1000` —— 内层翻倍、外层加、终端给基数 |
 | 定时器效果 | 旧 goroutine 先停表、新 goroutine 再启动（LIFO）；注销会等它真正退出；每次 tick 都经 `App.Do` 回到调度器 |
+| 配置插值 | 入口配置保留 `${env:NAME}` 模板，插件收到展开后的值 |
+| 效果自省 + 自定义出口 | `Effects()` 列出存活效果标签；带 `Levels` 的额外 `Exporter` 与默认 stderr 出口并存，只收 warn 及以上 |
+| 配置插值 | 入口配置保留 `${env:NAME}` 模板，插件收到展开后的值 |
+| 效果自省 + 自定义出口 | `Effects()` 列出存活效果标签；带 `Levels` 的额外 `Exporter` 与默认 stderr 出口并存，只收 warn 及以上 |
 
 ---
 
 ## 10. 测试覆盖
 
-`go test ./...` → **89 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **91 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
-**核心运行时（`cordis_test.go`，43 项）**
+**核心运行时（`cordis_test.go`，45 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -506,7 +510,9 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestEventPrependOrder` | `ListenOptions{Prepend: true}` 插入注册序头部 |
 | `TestEventDispatchSnapshot` | 分发在快照上进行：自注销不跳过相邻监听器，分发中登记的监听器本次不生效 |
 | `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` 可观察其它域的 `internal/service` 事件 |
-| `TestRegistryIteration` | `Values()` / `Keys()` / `ForEach()` 按注册序、随注销收缩、遍历快照 |
+| `TestRegistryIteration` | `Values()` / `Keys()` / `Entries()` / `ForEach()` 按注册序、随注销收缩、遍历快照 |
+| `TestDispatchModesOnContext` | `Serial` 首个非 nil 即终止、`Bail` 抛出 panic、`Parallel` 聚合错误、`Emit` 两者都忽略 |
+| `TestEffectDisposeVariants` | 空 Dispose、手动注销幂等、`execute` 出错时回收已产生的清理 |
 | `TestInternalDispatchObserver` | 五种分发模式都被观测到，`internal/*` 不触发观测 |
 | `TestServiceReadWriteInterception` | `internal/get` 可改写/覆盖读取；`internal/set` 可否决写入（`ErrServiceNotSet`） |
 | `TestFiberEffectsIntrospection` | `Effects()` 按注册序列出存活效果标签，注销后清空 |
@@ -514,6 +520,8 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestContextIsAndInjectList` | `Is()`（含 nil 指针情形）与 inject 的数组形式 |
 | `TestUpdateWhileDependencyReloads` | 提供者与依赖者同时更新，收敛到最终组合、不出现中间态 |
 | `TestNestedPluginSnapshot` | Apply 里实例化的子插件自成 Runtime 与 `ctx.plugin()` 效果，并随父级联注销 |
+| `TestDispatchModesOnContext` | `Serial` 首个非 nil 即终止、`Bail` 抛出 panic、`Parallel` 聚合错误、`Emit` 两者都忽略 |
+| `TestEffectDisposeVariants` | 空 Dispose、手动注销幂等、`execute` 出错时回收已产生的清理 |
 
 | `TestUpdateEventHookScope` | 非 global 的 `internal/update` 监听器只拦本 fiber；global 的对所有 fiber 生效 |
 | `TestUpdateHookNoSaveAndVeto` | `noSave` 抵达钩子；返回 `false` 即否决配置替换与重启 |

@@ -200,6 +200,11 @@ func (e *Entry) Options() EntryOptions { return e.options }
 // Fiber 返回入口实例化的 Fiber（未加载/已禁用时为 nil）。
 func (e *Entry) Fiber() *Fiber { return e.fiber }
 
+// Context 返回入口的上下文（官方 `entry.context` 的同名访问器）：
+// 由入口的空间声明（isolate / intercept）派生。入口尚未加载、
+// 或已禁用并注销时为 nil。
+func (e *Entry) Context() *Context { return e.ctx }
+
 // Subgroup 返回分组入口的子组（非分组为 nil）。
 func (e *Entry) Subgroup() *EntryGroup { return e.subgroup }
 

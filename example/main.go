@@ -9,6 +9,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -265,6 +266,58 @@ func main() {
 		fmt.Println("   tick remove:", err)
 	}
 	fmt.Println("   定时器已注销：其 goroutine 随之退出")
+
+	// ---------------------------------------------------------------------------
+	// 配置插值：入口配置里的 ${env:NAME} 在交给插件前展开
+	//（分组配置即子入口列表，不参与插值）。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 配置插值：${env:NAME} ==")
+	os.Setenv("CORDIS_EXAMPLE_HOST", "10.0.0.7")
+	if _, err := loader.Create(cordis.EntryOptions{
+		ID:   "envdb",
+		Name: "database",
+		// map / slice 里的字符串同样会展开；这里用字符串以便直接观察。
+		Config: "postgres://${env:CORDIS_EXAMPLE_HOST}:5432/app",
+	}, "", -1); err != nil {
+		fmt.Println("   envdb create:", err)
+	}
+	// 入口配置保持模板原文，交给插件的是展开后的值（见上面 [database] connect 一行）。
+	if e, err := loader.Tree().Resolve("envdb"); err == nil {
+		fmt.Printf("   入口配置（原文）：%v\n", e.Options().Config)
+		fmt.Printf("   组件实际收到：%v\n", e.Fiber().Config())
+		fmt.Printf("   Evaluate(\"${env:CORDIS_EXAMPLE_HOST}\") = %s\n", e.Evaluate("${env:CORDIS_EXAMPLE_HOST}"))
+	}
+	_ = loader.Remove("envdb")
+
+	// ---------------------------------------------------------------------------
+	// 效果自省 + 自定义日志出口：
+	// Fiber.Effects() 列出当前仍生效的效果标签（注册序）；
+	// App.Logger().Exporter 追加一个出口，与默认 stderr 出口并存。
+	// ---------------------------------------------------------------------------
+
+	fmt.Println("\n== 效果自省与自定义日志出口 ==")
+	var collected []string
+	stopLog := app.Logger().Exporter(&cordis.Exporter{
+		Levels: map[string]cordis.LogLevel{"": cordis.LevelWarn}, // 只收 warn 及以上
+		Export: func(m cordis.LogMessage) { collected = append(collected, m.Text) },
+	})
+	app.DoSync(func(ctx *cordis.Context) {
+		if e, err := loader.Tree().Resolve("db-a"); err == nil && e.Fiber() != nil {
+			fmt.Printf("   %s 持有的效果：%v\n", e.ID(), e.Fiber().Effects())
+			ctx.Logger().Warn("重载 %s 的连接池", e.ID())
+			e.Fiber().Update("postgres://tenant-a?pool=8")
+		}
+	})
+	fmt.Printf("   自定义出口收到 %d 条（warn 及以上）\n", len(collected))
+	stopLog() // 注销出口（幂等）
+	// 卸载后自省为空。
+	app.DoSync(func(ctx *cordis.Context) {
+		if e, err := loader.Tree().Resolve("db-a"); err == nil && e.Fiber() != nil {
+			e.Fiber().Dispose()
+		}
+	})
+	app.Wait()
 
 	// ---------------------------------------------------------------------------
 	// 关闭：沿效果链级联回收——全部组件按依赖逆序完全还原环境。

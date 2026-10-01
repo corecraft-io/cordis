@@ -108,6 +108,21 @@ func (r *Registry) Keys() []*Plugin {
 	return out
 }
 
+// RegistryItem 注册表的一项：`Plugin → Runtime` 配对。
+type RegistryItem struct {
+	Plugin  *Plugin
+	Runtime *Runtime
+}
+
+// Entries 按注册序返回全部项（官方 `registry.entries()`）。
+func (r *Registry) Entries() []RegistryItem {
+	out := make([]RegistryItem, 0, len(r.order))
+	for _, rt := range r.order {
+		out = append(out, RegistryItem{Plugin: rt.plugin, Runtime: rt})
+	}
+	return out
+}
+
 // ForEach 按注册序遍历全部插件及其 Runtime（官方 `registry.forEach`）。
 // 回调内不得增删注册表——遍历的是快照，修改会在下一轮才可见。
 func (r *Registry) ForEach(fn func(p *Plugin, rt *Runtime)) {

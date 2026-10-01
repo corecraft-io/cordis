@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 89 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 91 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -118,7 +118,7 @@ Three layers, matching the diagram:
 | `events.go` | 337 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`) and listener routing |
 | `disposable.go` | 92 | Two-phase dispose steps and the order-preserving list |
 | `loader.go` | 970 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
-| `example/main.go` | 290 | End-to-end example: hot reload, degradation, isolation, tree snapshots, logging, waterfall chain, timer effect |
+| `example/main.go` | 333 | End-to-end example: hot reload, degradation, isolation, tree snapshots, logging, waterfall chain, timer effect, config interpolation, effect introspection |
 | `cordis_test.go` | 2171 | Core runtime tests (43 + 1 benchmark) |
 | `alignment_suite_test.go` | 201 | Upstream suites ported: concurrent updates, nested plugins, commit read/write rules (3) |
 | `loader_test.go` | 887 | Loader tests (17 + 1 benchmark) |
@@ -138,7 +138,7 @@ Three layers, matching the diagram:
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 89 tests
+go test ./...          # 91 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -471,16 +471,18 @@ stateDiagram-v2
 | named loggers | an explicit name beats the plugin-derived one; a `debug` line below the `info` threshold never reaches the buffer |
 | waterfall chain | `(21 * 2) + 1000` — the inner listener doubles, the outer one adds, the terminal supplies the base |
 | timer effect | the old goroutine stops before the new one starts (LIFO), unloading waits for it to exit, and every tick re-enters through `App.Do` |
+| config interpolation | the entry keeps the `${env:NAME}` template, the plugin receives the expanded value |
+| effect introspection + custom sink | `Effects()` lists live labels; an extra `Exporter` with its own `Levels` collects warn-and-above alongside the default stderr sink |
 
 ---
 
 ## 10. Test Coverage
 
-`go test ./...` → **89 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **91 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 
-**Core runtime (`cordis_test.go`, 43 tests)**
+**Core runtime (`cordis_test.go`, 45 tests)**
 
 | Test | Coverage |
 | --- | --- |
@@ -509,13 +511,16 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestEventPrependOrder` | `ListenOptions{Prepend: true}` inserts at the head |
 | `TestEventDispatchSnapshot` | dispatch runs on a snapshot: self-unregistering listeners cannot skip neighbours, late registrations miss the current dispatch |
 | `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` sees other realms' `internal/service` events |
-| `TestRegistryIteration` | `Values()` / `Keys()` / `ForEach()` follow registration order, shrink on delete, and iterate a snapshot || `TestInternalDispatchObserver` | every mode is observable as (mode, name, args, ctx) and `internal/*` never triggers it |
+| `TestRegistryIteration` | `Values()` / `Keys()` / `Entries()` / `ForEach()` follow registration order, shrink on delete, and iterate a snapshot |
+| `TestInternalDispatchObserver` | every mode is observable as (mode, name, args, ctx) and `internal/*` never triggers it |
 | `TestServiceReadWriteInterception` | `internal/get` can replace or override a read; `internal/set` can veto a write (`ErrServiceNotSet`) |
 | `TestFiberEffectsIntrospection` | `Effects()` lists live effect labels in registration order and empties on dispose |
 | `TestFiberRestart` | `Restart()` reloads without touching config, and cannot revive a failed fiber |
 | `TestContextIsAndInjectList` | `Is()` (incl. the nil-pointer case) and the array form of `inject` |
 | `TestUpdateWhileDependencyReloads` | provider and consumer updated together converge on the final combination, with no stale intermediate |
 | `TestNestedPluginSnapshot` | a plugin instantiated inside `Apply` shows up as its own `Runtime` and `ctx.plugin()` effect, and cascades away |
+| `TestDispatchModesOnContext` | `Serial` stops at the first non-nil result, `Bail` propagates panics, `Parallel` aggregates errors, `Emit` ignores both |
+| `TestEffectDisposeVariants` | a nil dispose, manual dispose idempotency, and an error from `execute` reclaiming what it already produced |
 
 | `TestUpdateEventHookScope` | a non-global `internal/update` listener only intercepts its own fiber; global ones see every fiber |
 | `TestUpdateHookNoSaveAndVeto` | `noSave` reaches hooks; returning `false` vetoes config replacement and restart |

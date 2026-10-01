@@ -1830,6 +1830,17 @@ func TestRegistryIteration(t *testing.T) {
 				t.Fatal("ForEach: plugin/runtime mismatch")
 			}
 		})
+		// Entries() 等价的配对形式（官方 registry.entries()）。
+		var pairs []string
+		for _, item := range ctx.Registry().Entries() {
+			if item.Runtime.Plugin() != item.Plugin {
+				t.Fatal("Entries: plugin/runtime mismatch")
+			}
+			pairs = append(pairs, item.Plugin.Name)
+		}
+		if fmt.Sprint(pairs) != fmt.Sprint([]string{"one", "two"}) {
+			t.Fatalf("Entries(): %v", pairs)
+		}
 	})
 	if fmt.Sprint(names) != fmt.Sprint([]string{"one", "two"}) {
 		t.Fatalf("registration order: %v", names)
@@ -2123,6 +2134,175 @@ func TestContextIsAndInjectList(t *testing.T) {
 	})
 	if fmt.Sprint(seen) != fmt.Sprint([]string{"ready"}) {
 		t.Fatalf("array-form inject: %v", seen)
+	}
+}
+
+// TestDispatchModesOnContext 五种分发模式的语义（此前只有 internal/dispatch
+// 的观测用例，这里是行为断言）：
+//   - Emit：忽略返回值与错误（错误记日志）
+//   - Serial：首个非 nil 的返回值终止分发
+//   - Bail：同 Serial，但同步抛出 panic
+//   - Parallel：聚合全部错误
+func TestDispatchModesOnContext(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var calls []string
+	h.run(func(ctx *cordis.Context) {
+		// Serial：前两个返回 nil，第三个给出结果，第四个不得被调用。
+		for i := 1; i <= 4; i++ {
+			n := i
+			if _, err := ctx.On("demo/serial", func(*cordis.Context, ...any) any {
+				calls = append(calls, fmt.Sprintf("s%d", n))
+				if n == 3 {
+					return "answer"
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := ctx.Serial("demo/serial"); got != "answer" {
+			t.Fatalf("serial result: %v", got)
+		}
+	})
+	if fmt.Sprint(calls) != fmt.Sprint([]string{"s1", "s2", "s3"}) {
+		t.Fatalf("serial dispatch: %v", calls)
+	}
+
+	// Parallel：两个监听器都出错，错误被聚合成一个。
+	calls = nil
+	h.run(func(ctx *cordis.Context) {
+		for _, name := range []string{"a", "b"} {
+			n := name
+			if _, err := ctx.On("demo/parallel", func(*cordis.Context, ...any) any {
+				calls = append(calls, n)
+				panic(fmt.Sprintf("boom-%s", n))
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		err := ctx.Parallel("demo/parallel")
+		if err == nil {
+			t.Fatal("parallel must aggregate errors")
+		}
+		if !strings.Contains(err.Error(), "boom-a") || !strings.Contains(err.Error(), "boom-b") {
+			t.Fatalf("aggregated error: %v", err)
+		}
+	})
+	if fmt.Sprint(calls) != fmt.Sprint([]string{"a", "b"}) {
+		t.Fatalf("parallel dispatch: %v", calls)
+	}
+
+	// Bail：同步抛出 panic（不吞）。
+	panicked := false
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("demo/bail", func(*cordis.Context, ...any) any {
+			panic("bail-out")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		_ = ctx.Bail("demo/bail")
+	})
+	if !panicked {
+		t.Fatal("bail must propagate the panic synchronously")
+	}
+
+	// Emit：返回值与错误都被忽略（错误记日志，不中断）。
+	calls = nil
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("demo/emit", func(*cordis.Context, ...any) any {
+			calls = append(calls, "first")
+			panic("ignored")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ctx.On("demo/emit", func(*cordis.Context, ...any) any {
+			calls = append(calls, "second")
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ctx.Emit("demo/emit")
+	})
+	if fmt.Sprint(calls) != fmt.Sprint([]string{"first", "second"}) {
+		t.Fatalf("emit must not stop on a panicking listener: %v", calls)
+	}
+}
+
+// TestEffectDisposeVariants 效果返回值的几种形态（对齐官方 dispose.spec
+// 里可移植的部分）：execute 返回 nil 表示"无需清理"；手动调用返回的
+// Dispose 幂等；execute 出错时不登记任何效果。
+func TestEffectDisposeVariants(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var (
+		cleaned int
+		applied int
+	)
+	p := &cordis.Plugin{
+		Name: "owner",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			applied++
+			// 1) execute 返回 nil：没有清理动作可登记。
+			d, err := ctx.Effect("nothing", func() (cordis.Dispose, error) {
+				return nil, nil
+			})
+			if err != nil {
+				return err
+			}
+			// 空 Dispose 也可以安全调用。
+			d()
+
+			// 2) 手动注销：重复调用只生效一次。
+			d, err = ctx.Effect("manual", func() (cordis.Dispose, error) {
+				return func() { cleaned++ }, nil
+			})
+			if err != nil {
+				return err
+			}
+			d()
+			d()
+			d()
+
+			// 3) execute 出错：返回错误，效果未登记，已产生的清理立即回收。
+			if _, err := ctx.Effect("failing", func() (cordis.Dispose, error) {
+				return func() { cleaned++ }, errors.New("effect failed")
+			}); err == nil {
+				return errors.New("expected an error from Effect")
+			}
+			return nil
+		},
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	// manual 的清理一次 + failing 的清理一次（execute 出错也要回收）。
+	if cleaned != 2 {
+		t.Fatalf("cleanups: %d, want 2", cleaned)
+	}
+	// 三条效果都没留在撤销链上：nothing/manual 被手动注销，
+	// failing 压根没登记（它出错，清理已就地执行）。
+	if f.State() != cordis.StateActive {
+		t.Fatalf("state: %v, want active (the error was handled in Apply)", f.State())
+	}
+	if got := f.Effects(); len(got) != 0 {
+		t.Fatalf("effects still registered: %v", got)
+	}
+	if applied != 1 {
+		t.Fatalf("apply count: %d", applied)
 	}
 }
 

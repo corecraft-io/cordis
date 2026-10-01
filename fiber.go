@@ -447,11 +447,17 @@ func (f *Fiber) refresh() {
 
 // Effect 执行 execute 并把其返回的清理函数绑定到当前 fiber：
 // fiber 卸载时按 LIFO 逆序自动调用，也可提前手动调用。
-// execute 出错时，已产生的清理动作立即逆序执行并返回错误。
+//
+// execute 出错时**先回收它已经产生的清理动作**再返回错误——与上面对
+// EffectIter 的处理同理：此时效果尚未登记进 fiber 的撤销链，丢掉就
+// 再无人认领（官方实现同样是 catch → dispose() → throw）。
 func (f *Fiber) Effect(label string, execute func() (Dispose, error)) (Dispose, error) {
 	return f.effectStep(label, func() (disposeStep, error) {
 		d, err := execute()
 		if err != nil {
+			if d != nil {
+				f.safeDispose(label, d)
+			}
 			return disposeStep{}, err
 		}
 		if d == nil {
