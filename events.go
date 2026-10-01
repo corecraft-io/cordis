@@ -2,35 +2,10 @@ package cordis
 
 import (
 	"fmt"
-	"os"
-	"sync"
 )
 
-// Logger 极简日志器。效果回收与组件执行中的错误一律被运行时吞掉并
-// 记录于此（对应官方实现的行为：dispose 失败不阻断其余清理）。
-type Logger struct {
-	mu    sync.Mutex
-	Error func(format string, args ...any)
-	Warn  func(format string, args ...any)
-	Info  func(format string, args ...any)
-}
-
-func newLogger() *Logger {
-	l := &Logger{}
-	logf := func(w *os.File, level string) func(string, ...any) {
-		return func(format string, args ...any) {
-			l.mu.Lock()
-			defer l.mu.Unlock()
-			fmt.Fprintf(w, "[cordis:"+level+"] "+format+"\n", args...)
-		}
-	}
-	l.Error = logf(os.Stderr, "error")
-	l.Warn = logf(os.Stderr, "warn")
-	l.Info = logf(os.Stderr, "info")
-	return l
-}
-
-func (a *App) Logger() *Logger { return a.logger }
+// Logger 见 logger.go：日志服务由根上下文持有（`App.Logger()`），
+// 组件内用 `ctx.Logger()` 取带插件名的日志器。
 
 // Listener 事件监听器。回调收到的 ctx 是分发方上下文（Emit/Serial/…
 // 的调用者）；waterfall 模式还会在参数末尾追加 next。

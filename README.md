@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 65 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 75 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -50,6 +50,8 @@ Places where this implementation knowingly does **not** mirror the official one,
 | effects | may be async (`Promise`, async generators); dispose is awaitable | synchronous `Dispose`; async cleanup is the two-phase `disposeStep{run, wait}`, and `Wait()` reports convergence | same reason — one scheduler goroutine, no promise machinery |
 | config validation | Standard Schema (`~standard.validate`) | `Plugin.Validate func(any) (any, error)` | no Standard Schema in Go; the error contract (structural vs config failure) is preserved |
 | `@Inject` decorator | class method decorator | N/A | Go has no decorators; `Plugin.Inject` and `ctx.Inject` express the same thing |
+| log message target | `WeakRef<Fiber>` on every `LogMessage` | `FiberName` + `UID` | Go has no weak references; keeping a strong `*Fiber` in a 1000-entry buffer would retain torn-down instances |
+| `loader/patch-context` | listeners mutate the context's isolate/intercept tables in place | a waterfall that **wraps** the rebuild | Go's context chain is immutable, so a listener observes and orders the rebuild instead of rewriting its realm tables |
 
 ---
 
@@ -84,16 +86,19 @@ Three layers, matching the diagram:
 | --- | --- | --- |
 | `cordis.go` | 97 | Package doc, `FiberState`, error values, `Plugin` |
 | `app.go` | 225 | `App` host, scheduler, `Wait` / `Close` |
-| `context.go` | 257 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
+| `context.go` | 269 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
 | `fiber.go` | 643 | State machine, epoch chasing, effects and LIFO disposal, local update hooks, hot config update |
 | `reflect.go` | 294 | Coeffect store, realm key resolution, reverse dependency index and notifications |
 | `registry.go` | 213 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points |
-| `events.go` | 339 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`), listener routing, `Logger` |
+| `logger.go` | 369 | Log levels, named loggers, exporters and the bounded message buffer |
+| `events.go` | 314 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`) and listener routing |
 | `disposable.go` | 72 | Two-phase dispose steps and the order-preserving list |
-| `loader.go` | 785 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
+| `loader.go` | 902 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | End-to-end example covering hot reload, degradation and isolation |
-| `cordis_test.go` | 1832 | Core runtime tests (37 + 1 benchmark) |
+| `cordis_test.go` | 1835 | Core runtime tests (37 + 1 benchmark) |
 | `loader_test.go` | 887 | Loader tests (17 + 1 benchmark) |
+| `loader_events_test.go` | 283 | Loader event surface, tree snapshots, builtins and logs (5) |
+| `logger_test.go` | 252 | Logger naming, level filtering, exporters and buffer (5) |
 | `index_internal_test.go` | 411 | Reverse index lifecycle invariants (white-box) |
 | `disposable_internal_test.go` | 125 | Tombstone compaction invariants and benchmarks (1 + 3, white-box) |
 | `registry_internal_test.go` | 145 | `Runtime` add/remove consistency (white-box) |
@@ -107,7 +112,7 @@ Three layers, matching the diagram:
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 65 tests
+go test ./...          # 75 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -238,6 +243,15 @@ Dispatch always runs over a **snapshot** of the listener list: a listener that u
 
 Built-in events: `internal/plugin` (instance created/disposed), `internal/status` (state transitions), `internal/service` (service up/down), `internal/update` (hot config update chain), `internal/listener` (registration-time hook).
 
+The declarative layer adds four of its own (the upstream `loader/*` events):
+
+| Event | When | Shape |
+| --- | --- | --- |
+| `loader/entry-init` | an entry is constructed, before its context is derived | `(entry)` |
+| `loader/patch-context` | the entry's context is (re)built — a **waterfall**, so a listener may act both before and after `next` | `(entry, next)` |
+| `loader/partial-dispose` | the entry survives while its instance is replaced or hot-reloaded (`active == true`), or a group drops the child (`active == false`) | `(entry, legacy, active)` |
+| `loader/config-update` | fired by whoever wrote the configuration out (`Loader.NotifyConfigUpdate`) | `()` |
+
 ### 5.6 Hot Config Update
 
 `fiber.Update(config, noSave...)` re-validates the config and then dispatches `internal/update` as a waterfall chain:
@@ -278,6 +292,12 @@ loader.Load([]cordis.EntryOptions{
 | `EntryOptions.Inject` | Entry-level dependency overrides (`cordis.DepRemove` removes a declared dependency explicitly) |
 | `EntryTree.OnCommit` | Synchronous callback after every structural change, for persistence |
 | `NewLoader` | The same plugin may be instantiated many times, sharing one `Runtime` |
+| `EntryTree.Entries()` / `Pending()` | Whole-tree snapshots: all entries (sorted by short id) / entries whose instance has not settled |
+| `EntryTree.Wait()` / `Loader.Wait()` | Wait for the whole tree to converge, reporting whether it did |
+| `Loader.Locate(fiber)` | Map an instance (including plugins nested inside an entry) back to its entry |
+| `Loader.Builtins(map)` | Resolve `Name: "cordis:<key>"` from the builtin table instead of the resolver |
+| `Loader.SetLogs(true)` | Log `apply` / `reload` / `unload` through the `loader` logger |
+| `Loader.NotifyConfigUpdate()` | Emit `loader/config-update` once the configuration has been persisted |
 
 Dispatch rules for configuration changes (`Entry.update`):
 
@@ -285,6 +305,27 @@ Dispatch rules for configuration changes (`Entry.update`):
 - A change to a spatial declaration (`Name` / `Group` / `Inject` / `Isolate` / `Intercept`) **detaches the old subtree synchronously**, disposes the old instance, then reloads fully under the new declaration. Effect reclamation is asynchronous, so the subtree structure must be consistent immediately or the short-id index collides during the rebuild.
 - A change to `Config` alone goes through `Fiber.Update(config, true)` (`noSave`: an update initiated by the loader never writes back to the entry config). If it fails `Validate`, the Fiber enters `failed` and stays on the entry, recovering in place once corrected.
 - A group entry reconciles its children through update hooks rather than restarting itself; a group config of the wrong type (not `[]EntryOptions`) is logged and the existing children are kept.
+
+### 5.8 Logging
+
+```go
+app.Logger()                       // *LoggerService: exporters + ring buffer
+ctx.Logger()                       // logger named after the current plugin
+ctx.Logger("database")             // explicit name
+ctx.Intercept("logger", cordis.LoggerOptions{Name: "db", Level: cordis.LevelDebug})
+```
+
+| Piece | Behaviour |
+| --- | --- |
+| `Logger` | a name plus a level threshold; `Error` / `Warn` / `Info` / `Debug` take a format string and arguments |
+| name resolution | explicit argument → `logger` intercept config → owning plugin name (`root` outside any plugin) |
+| `LogMessage` | `Seq` · `Time` · `Name` · `Level` · `Text` · `FiberName` · `UID` |
+| `Exporter` | one destination with its own `Levels` map; the threshold for a name is `Levels[name]` → `Levels[""]` → the logger's own level (`LevelInfo` by default) |
+| `App.Logger().Exporter(e)` · `ctx.Logger().Exporter(e)` | registers an extra destination and returns an idempotent `Dispose`. It is **not** a fiber effect: a log sink usually has to outlive the instance that registered it |
+| `Capture` / `Silence` | replace / drop the default stderr destination (tests, embedders) |
+| ring buffer | `DefaultBufferSize` (1000) messages, oldest dropped first; `Messages()` snapshots it and `SetBufferSize(n)` resizes it (`0` disables). The buffer follows the logger's own threshold, i.e. it behaves like an exporter without `Levels` |
+
+Everything the runtime reports about itself — failed `apply`, dispose panics, event listener panics, loader structure changes — goes through this service, with the plugin's own name attached.
 
 ---
 
@@ -341,7 +382,7 @@ stateDiagram-v2
 | `Root()` | Root context, scheduler-side only |
 | `Wait()` | Waits for stability, returns whether it converged |
 | `Close()` | Cascades reclamation and stops the scheduler |
-| `Logger()` | Logger accessor; `Error` / `Warn` / `Info` are all replaceable |
+| `Logger()` | The `LoggerService`: exporters, ring buffer, and `Error` / `Warn` / `Info` / `Debug` shorthand |
 
 ### `Context`
 
@@ -368,6 +409,10 @@ stateDiagram-v2
 
 `State()` · `Err()` · `Config()` · `UID()` · `Update(config, noSave…)` · `OnUpdate(hook(config, noSave) bool)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
 
+### Logger
+
+`LogLevel` (`LevelError` < `LevelWarn` < `LevelInfo` < `LevelDebug`) · `LogMessage` · `Exporter{Levels, Export}` · `LoggerOptions{Name, Level}` · `Logger{Name, Level, Service, Exporter, Error, Warn, Info, Debug}` · `LoggerService{Logger, Exporter, Capture, Silence, Messages, BufferSize, SetBufferSize, Error, Warn, Info, Debug}`
+
 ### Error Values
 
 `ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound` · `ErrDuplicateNext`
@@ -390,7 +435,7 @@ stateDiagram-v2
 
 ## 10. Test Coverage
 
-`go test ./...` → **65 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **75 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 
@@ -432,7 +477,7 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestEffectIterPanicReclaimsYielded` | a panic inside `iter` reclaims everything already yielded, in LIFO order, and still propagates |
 | `TestFailedFiberDoesNotReenterOnDependencyRefresh` | a failed fiber stays frozen through dependency churn; only `Update` recovers it |
 
-**Loader (`loader_test.go`, 17 tests)**
+**Loader (`loader_test.go` 17 + `loader_events_test.go` 5)**
 
 | Test | Coverage |
 | --- | --- |
@@ -446,6 +491,21 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestLoaderLargeLoad` | 1100 entries in one load without deadlock |
 | `TestLoaderIsolateMigration` | adding/removing `isolate` on either side (relevant vs irrelevant service names, shared-realm references) is equivalent to teardown + rebuild |
 | `TestLoaderIsolateTransfer` | a cross-group move keeps the realm identity intact |
+| `TestLoaderEventSurface` | `entry-init` / `patch-context` (both sides of the chain) / `partial-dispose` (`active` true and false) / `config-update` |
+| `TestLoaderEntriesAndWait` | `Entries()` spans the whole tree in stable order; `Pending()` is empty once converged, even with an unsatisfied dependency |
+| `TestLoaderLocate` | an instance — including a plugin nested inside an entry — maps back to its own entry |
+| `TestLoaderBuiltins` | `cordis:<name>` hits the builtin table and never falls through to the resolver |
+| `TestLoaderLogs` | `SetLogs` emits `apply` / `reload` / `unload` through the `loader` logger only when enabled, and skips group entries |
+
+**Logger (`logger_test.go`, 5 tests)**
+
+| Test | Coverage |
+| --- | --- |
+| `TestLoggerNameResolution` | explicit name > `logger` intercept > plugin name, and the message carries the producing instance |
+| `TestLoggerLevelFiltering` | exporter threshold precedence `Levels[name]` → `Levels[""]` → the logger's own level |
+| `TestLoggerExporterDispose` | extra exporters are removable and idempotent, the default destination survives |
+| `TestLoggerBufferIsBoundedAndChronological` | the ring buffer stays bounded and in order, resizes down, and `0` disables it |
+| `TestLoggerSilence` | the default destination can be silenced while the buffer keeps recording |
 
 **Internal invariants (white-box)**
 

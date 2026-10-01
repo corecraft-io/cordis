@@ -250,7 +250,7 @@ func (f *Fiber) doLoad() {
 		f.store[k] = v
 	}
 	if err := f.execute(); err != nil {
-		f.app.logger.Error("plugin %s apply failed: %v", f.name(), err)
+		f.ctx.Logger().Error("apply failed: %v", err)
 		f.err = err
 		// 直接改写 epoch（不经 setEpoch），失败后走卸载路径。
 		f.ep = inactiveEpoch
@@ -387,7 +387,7 @@ func (f *Fiber) checkImpl(name string) {
 func (f *Fiber) safeCheck(im *impl) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			f.app.logger.Error("service %q check panic: %v", im.name, r)
+			f.ctx.Logger().Error("service %q check panic: %v", im.name, r)
 			ok = false
 		}
 	}()
@@ -526,7 +526,7 @@ func (f *Fiber) safeDispose(label string, d Dispose) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			f.app.logger.Error("effect %q dispose panic: %v", label, r)
+			f.ctx.Logger().Error("effect %q dispose panic: %v", label, r)
 		}
 	}()
 	d()
@@ -629,7 +629,7 @@ func (f *Fiber) Update(config any, noSave ...bool) error {
 		}, cfg, skip)
 	}()
 	if hookErr != nil {
-		f.app.logger.Error("plugin %s update: %v", f.name(), hookErr)
+		f.ctx.Logger().Error("update: %v", hookErr)
 	}
 	return hookErr
 }

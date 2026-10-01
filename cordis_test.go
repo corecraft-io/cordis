@@ -732,9 +732,12 @@ func TestDisposePanicLogged(t *testing.T) {
 	defer h.app.Close()
 
 	var logged []string
-	h.app.Logger().Error = func(format string, args ...any) {
-		logged = append(logged, fmt.Sprintf(format, args...))
-	}
+	var logMu sync.Mutex
+	h.app.Logger().Capture(func(m cordis.LogMessage) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logged = append(logged, fmt.Sprintf("[%s] %s: %s", m.Level, m.Name, m.Text))
+	})
 
 	var order []string
 	p := &cordis.Plugin{

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -76,6 +77,16 @@ func (g *EntryGroup) ctx() *Context {
 	return g.tree.ctx
 }
 
+// newEntry 构造入口并登记进树索引，随即分发 loader/entry-init
+// （对应官方在 Entry 构造函数里发同名事件：此时入口的上下文尚未派生，
+// 事件携带的是所属分组的上下文）。
+func (g *EntryGroup) newEntry(opt EntryOptions) *Entry {
+	e := &Entry{loader: g.tree.loader, parent: g, options: opt}
+	g.tree.store[opt.ID] = e
+	g.ctx().Emit("loader/entry-init", e)
+	return e
+}
+
 func (g *EntryGroup) removeChild(e *Entry) {
 	for i, c := range g.children {
 		if c == e {
@@ -127,6 +138,9 @@ func (g *EntryGroup) reconcile(options []EntryOptions) {
 		}
 		g.removeChild(e)
 		legacy := e.options
+		// active=false：不是入口自身改配置，而是被分组协调摘掉
+		//（对应官方 EntryGroup.remove 的同名事件）。
+		g.ctx().Emit("loader/partial-dispose", e, legacy, false)
 		e.remove()
 		tree.commit(EntryChange{ID: legacy.ID, Group: g, Legacy: &legacy})
 		delete(oldByID, e.options.ID)
@@ -155,8 +169,7 @@ func (g *EntryGroup) reconcile(options []EntryOptions) {
 			tree.loader.ctx.app.logger.Error("duplicate entry id %q (already exists in another group)", opt.ID)
 			continue
 		}
-		e := &Entry{loader: tree.loader, parent: g, options: opt}
-		tree.store[opt.ID] = e
+		e := g.newEntry(opt)
 		e.init()
 		children = append(children, e)
 		created := e.options
@@ -253,12 +266,26 @@ func (e *Entry) buildContext() {
 	e.ctx = e.parent.ctx().extendWithEntry(e, isolates, e.options.Intercept)
 }
 
-// init 解析插件并实例化 Fiber；分组入口固定实例化内置分组插件。
+// init 派生上下文、解析插件并实例化 Fiber；分组入口固定实例化内置
+// 分组插件。
+//
+// 全过程包在 loader/patch-context 洋葱链里（官方实现的同一扩展点）：
+// 监听器可在 next 前后各做一步，官方的 isolate 插件正是靠它在重载
+// 前后迁移域实现。Go 的上下文链不可变，因此这里的"patch"表现为
+// **环绕重建**而非就地改写域表。
 func (e *Entry) init() {
 	if e.Disabled() || e.fiber != nil {
 		return
 	}
-	e.buildContext()
+	e.parent.ctx().Waterfall("loader/patch-context", func() any {
+		e.buildContext()
+		e.load()
+		return nil
+	}, e)
+}
+
+// load 在上文构建好的上下文里实例化插件（init 的第二段）。
+func (e *Entry) load() {
 	p := groupPlugin
 	if !e.options.Group {
 		var err error
@@ -268,6 +295,7 @@ func (e *Entry) init() {
 			return
 		}
 	}
+	e.loader.showLog(e, "apply")
 	f, err := e.ctx.Registry().PluginInject(e.ctx, p, e.options.Config, refineInject(p.Inject, e.options.Inject))
 	if err != nil {
 		if f == nil {
@@ -302,6 +330,7 @@ func (e *Entry) disposeFiber() {
 	f := e.fiber
 	e.fiber = nil
 	delete(e.loader.entryFibers, f)
+	e.loader.showLog(e, "unload")
 	f.Dispose()
 }
 
@@ -361,6 +390,9 @@ func (e *Entry) update(options EntryOptions) {
 		return
 	}
 	if e.fiber != nil {
+		// 入口存活、仅选项变化（含空间声明）：实例会被替换或热重载，
+		// 两者都算"部分撤销"——订阅方据此清理与旧配置绑定的外部资源。
+		e.parent.ctx().Emit("loader/partial-dispose", e, legacy, true)
 		if ctxChanged {
 			e.disposeFiber()
 			e.detachSubgroup()
@@ -377,6 +409,7 @@ func (e *Entry) update(options EntryOptions) {
 			return
 		}
 		if !reflect.DeepEqual(legacy.Config, options.Config) {
+			e.loader.showLog(e, "reload")
 			if err := e.fiber.Update(e.options.Config, true); err != nil {
 				e.loader.ctx.app.logger.Error("entry %s: %v", e.ID(), err)
 			}
@@ -526,6 +559,35 @@ func (t *EntryTree) OnCommit(fn func(change EntryChange)) {
 	t.onCommit = fn
 }
 
+// Entries 返回全树入口快照，按短 ID 升序（顺序稳定，便于断言与
+// 遍历输出）。树的 store 本身是扁平的：短 ID 全树唯一，因此不需要
+// 递归子组。
+func (t *EntryTree) Entries() []*Entry {
+	out := make([]*Entry, 0, len(t.store))
+	for _, e := range t.store {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].options.ID < out[j].options.ID })
+	return out
+}
+
+// Pending 返回尚未稳定的入口：其实例仍处于加载/卸载转换中。
+// 依赖未满足的 pending 实例是稳定态，不算在内。
+func (t *EntryTree) Pending() []*Entry {
+	var out []*Entry
+	for _, e := range t.Entries() {
+		if e.fiber != nil && !e.fiber.stable() {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Wait 在调度器上等待全树收敛，返回是否真正稳定。
+func (t *EntryTree) Wait() bool {
+	return t.ctx.app.Wait()
+}
+
 // Load 以声明式配置协调根组（可重复调用，实现整体协调）。
 func (t *EntryTree) Load(options []EntryOptions) {
 	t.root.reconcile(options)
@@ -585,8 +647,7 @@ func (t *EntryTree) Create(options EntryOptions, parent string, position int) (*
 	if _, dup := t.store[options.ID]; dup {
 		return nil, fmt.Errorf("cordis: duplicate entry id %q", options.ID)
 	}
-	e := &Entry{loader: t.loader, parent: g, options: options}
-	t.store[options.ID] = e
+	e := g.newEntry(options)
 	g.insertChild(e, position)
 	e.init()
 	created := e.options
@@ -656,6 +717,8 @@ type Loader struct {
 	ctx         *Context
 	resolve     func(name string) (*Plugin, error)
 	entryFibers map[*Fiber]*Entry
+	builtins    map[string]*Plugin
+	enableLogs  bool
 }
 
 // NewLoader 创建 loader 并挂载到 app 的根上下文。
@@ -664,7 +727,13 @@ type Loader struct {
 // 对应官方实现的动态模块导入。所有入口结构操作
 // （Load/Create/Remove/Update）经 DoSync 在调度器上执行。
 func NewLoader(app *App, resolve func(name string) (*Plugin, error)) *Loader {
-	l := &Loader{resolve: resolve, entryFibers: make(map[*Fiber]*Entry)}
+	l := &Loader{
+		resolve:     resolve,
+		entryFibers: make(map[*Fiber]*Entry),
+		// 内置插件：入口以 "cordis:<name>" 命名即可命中（官方实现的
+		// builtins 表，默认带上内部分组插件）。
+		builtins: map[string]*Plugin{"group": groupPlugin},
+	}
 	app.DoSync(func(ctx *Context) {
 		l.ctx = ctx
 		l.tree = &EntryTree{ctx: ctx, loader: l, store: make(map[string]*Entry)}
@@ -749,10 +818,58 @@ func (l *Loader) Stop() {
 }
 
 func (l *Loader) resolvePlugin(name string) (*Plugin, error) {
+	if rest, ok := strings.CutPrefix(name, "cordis:"); ok {
+		p, ok := l.builtins[rest]
+		if !ok {
+			return nil, fmt.Errorf("cordis: unknown builtin plugin %q", name)
+		}
+		return p, nil
+	}
 	if l.resolve == nil {
 		return nil, fmt.Errorf("cordis: no plugin resolver")
 	}
 	return l.resolve(name)
+}
+
+// Builtins 追加/覆盖内置插件表（键为 "cordis:" 前缀之后的名字）。
+func (l *Loader) Builtins(m map[string]*Plugin) {
+	for name, p := range m {
+		l.builtins[name] = p
+	}
+}
+
+// SetLogs 开关 loader 的结构变更日志（apply / reload / unload），
+// 由名为 "loader" 的日志器输出。默认关闭：一次配置协调会产出多条日志，
+// 嵌入方通常按需打开。
+func (l *Loader) SetLogs(on bool) {
+	l.ctx.app.DoSync(func(*Context) { l.enableLogs = on })
+}
+
+// showLog 记录一次结构变更。分组入口自身不承载业务，不计入。
+func (l *Loader) showLog(e *Entry, action string) {
+	if !l.enableLogs || e.options.Group {
+		return
+	}
+	l.ctx.Logger("loader").Info("%s plugin %s", action, e.options.Name)
+}
+
+// Locate 由实例反查其所属入口（沿父链向上找第一个携带入口的上下文）。
+func (l *Loader) Locate(f *Fiber) *Entry {
+	for ctx := f.ctx; ctx != nil; ctx = ctx.parent {
+		if e := ctx.Entry(); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// Wait 等待 loader 收敛（等价于 Tree().Wait()）。
+func (l *Loader) Wait() bool { return l.tree.Wait() }
+
+// NotifyConfigUpdate 分发 loader/config-update：供配置写入方在落盘后
+// 通知监听器（官方实现里由 include 包等外部模块发射的同名事件）。
+func (l *Loader) NotifyConfigUpdate() {
+	l.ctx.app.DoSync(func(ctx *Context) { ctx.Emit("loader/config-update") })
 }
 
 // onPluginEvent 处理 internal/plugin 事件，追踪入口根 Fiber

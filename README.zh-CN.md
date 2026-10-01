@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 65 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 75 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -50,6 +50,8 @@
 | 效果 | 可为异步（`Promise`、async generator），撤销可 await | 同步 `Dispose`；异步清理用两阶段 `disposeStep{run, wait}` 表达，由 `Wait()` 汇报收敛 | 同上：单调度 goroutine，无 Promise 机制 |
 | 配置校验 | Standard Schema（`~standard.validate`） | `Plugin.Validate func(any) (any, error)` | Go 没有 Standard Schema；错误契约（结构性失败 vs 配置失败）保持一致 |
 | `@Inject` 装饰器 | 类方法装饰器 | N/A | Go 无装饰器；`Plugin.Inject` 与 `ctx.Inject` 表达同一件事 |
+| 日志消息的目标实例 | 每条 `LogMessage` 挂 `WeakRef<Fiber>` | `FiberName` + `UID` | Go 没有弱引用；在 1000 条的缓冲里持强 `*Fiber` 会把已注销实例拖住 |
+| `loader/patch-context` | 监听器就地改写上下文的 isolate/intercept 表 | 用洋葱链**环绕**重建 | Go 的上下文链不可变，监听器只能观察并给重建排序，不能就地改域表 |
 
 ---
 
@@ -84,16 +86,19 @@ flowchart TD
 | --- | --- | --- |
 | `cordis.go` | 97 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
 | `app.go` | 225 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
-| `context.go` | 257 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
+| `context.go` | 269 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
 | `fiber.go` | 643 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、局部更新钩子、配置热更新 |
 | `reflect.go` | 294 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
 | `registry.go` | 213 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
-| `events.go` | 339 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）、监听器路由与 `Logger` |
+| `logger.go` | 369 | 日志级别、命名日志器、出口与有界消息缓冲 |
+| `events.go` | 314 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）与监听器路由 |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
-| `loader.go` | 785 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
+| `loader.go` | 902 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 1832 | 核心运行时测试（37 项 + 1 基准） |
+| `cordis_test.go` | 1835 | 核心运行时测试（37 项 + 1 基准） |
 | `loader_test.go` | 887 | 声明式配置层测试（17 项 + 1 基准） |
+| `loader_events_test.go` | 283 | loader 事件面、全树快照、内置插件与日志（5 项） |
+| `logger_test.go` | 252 | 日志命名、级别过滤、出口与环形缓冲（5 项） |
 | `index_internal_test.go` | 411 | 依赖倒排索引的生命周期不变量（白盒） |
 | `disposable_internal_test.go` | 125 | 墓碑压缩的不变量与基准（1 项 + 3 基准，白盒） |
 | `registry_internal_test.go` | 145 | `Runtime` 增删一致性（白盒） |
@@ -107,7 +112,7 @@ flowchart TD
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 65 项测试
+go test ./...          # 75 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -236,6 +241,15 @@ ctx.Intercept("database", myConfig)   // 供提供者读取的拦截配置
 
 内置事件：`internal/plugin`（实例创建/注销）、`internal/status`（状态迁移）、`internal/service`（服务上下线）、`internal/update`（配置热更新链）、`internal/listener`（注册期扩展点）。
 
+声明式配置层另发四个（对应官方 `loader/*` 事件）：
+
+| 事件 | 时机 | 载荷 |
+| --- | --- | --- |
+| `loader/entry-init` | 入口构造完成、上下文尚未派生 | `(entry)` |
+| `loader/patch-context` | 入口上下文（重）建——**洋葱链**，监听器可在 `next` 前后各做一步 | `(entry, next)` |
+| `loader/partial-dispose` | 入口存活而实例被替换/热重载（`active == true`），或被分组协调摘除（`active == false`） | `(entry, legacy, active)` |
+| `loader/config-update` | 配置写入方落盘后自行分发（`Loader.NotifyConfigUpdate`） | `()` |
+
 ### 5.6 配置热更新
 
 `fiber.Update(config, noSave...)` 先校验新配置，再把 `internal/update` 作为洋葱链分发：
@@ -276,6 +290,12 @@ loader.Load([]cordis.EntryOptions{
 | `EntryOptions.Inject` | 入口级依赖增删覆盖（`cordis.DepRemove` 显式移除声明的依赖） |
 | `EntryTree.OnCommit` | 每次结构变更后同步回调，供持久化落盘 |
 | `NewLoader` | 同名插件可多次实例化，共享 `Runtime` |
+| `EntryTree.Entries()` / `Pending()` | 全树快照：全部入口（按短 ID 升序）/ 实例尚未稳定的入口 |
+| `EntryTree.Wait()` / `Loader.Wait()` | 等待全树收敛，返回是否真正稳定 |
+| `Loader.Locate(fiber)` | 由实例（含入口内嵌套的子插件）反查其所属入口 |
+| `Loader.Builtins(map)` | `Name: "cordis:<键>"` 命中内置插件表，不再走外部解析器 |
+| `Loader.SetLogs(true)` | 以 `loader` 日志器记录 `apply` / `reload` / `unload` |
+| `Loader.NotifyConfigUpdate()` | 配置落盘后分发 `loader/config-update` |
 
 配置变更的分派规则（`Entry.update`）：
 
@@ -283,6 +303,27 @@ loader.Load([]cordis.EntryOptions{
 - 空间声明变化（`Name` / `Group` / `Inject` / `Isolate` / `Intercept`）→ **同步摘下旧子树**、注销旧实例，再以新声明完整重载（旧实例的效果回收是异步的，子树结构必须立即一致，否则重建时短 ID 索引冲突）；
 - 仅 `Config` 变化 → 走 `Fiber.Update(config, true)`（`noSave`：loader 发起的更新不回写入口配置）热重载；配置未过 `Validate` 时 Fiber 进入 `failed` 并保留在入口上，修正后原地恢复；
 - 分组入口 → 通过更新钩子协调子入口，而非重启自身；分组配置类型错误（非 `[]EntryOptions`）记日志并保留现有子入口。
+
+### 5.8 日志
+
+```go
+app.Logger()                       // *LoggerService：出口表 + 环形缓冲
+ctx.Logger()                       // 以当前插件命名的日志器
+ctx.Logger("database")             // 显式命名
+ctx.Intercept("logger", cordis.LoggerOptions{Name: "db", Level: cordis.LevelDebug})
+```
+
+| 组成 | 行为 |
+| --- | --- |
+| `Logger` | 一个名字 + 一个级别阈值；`Error` / `Warn` / `Info` / `Debug` 接受格式串与参数 |
+| 名字解析 | 显式参数 → `logger` 拦截配置 → 所属插件名（不在插件内为 `root`） |
+| `LogMessage` | `Seq` · `Time` · `Name` · `Level` · `Text` · `FiberName` · `UID` |
+| `Exporter` | 一个出口，自带 `Levels` 表；某名字的阈值按 `Levels[名字]` → `Levels[""]` → 日志器自身级别（默认 `LevelInfo`）取 |
+| `App.Logger().Exporter(e)` · `ctx.Logger().Exporter(e)` | 追加出口并返回幂等的 `Dispose`。它**不是** fiber 效果：日志出口通常要比注册它的实例活得久 |
+| `Capture` / `Silence` | 替换 / 关闭默认的 stderr 出口（测试与嵌入方用） |
+| 环形缓冲 | 默认 `DefaultBufferSize`（1000）条，超出丢最旧；`Messages()` 取快照，`SetBufferSize(n)` 调整（`0` 表示不缓存）。缓冲跟随日志器自身阈值，等价于“一个不带 Levels 的出口” |
+
+运行时报出的全部信息——`apply` 失败、撤销 panic、事件监听器 panic、loader 结构变更——都走这条通路，并带上插件名。
 
 ---
 
@@ -339,7 +380,7 @@ stateDiagram-v2
 | `Root()` | 根上下文（仅限调度器上下文使用） |
 | `Wait()` | 等待系统稳定，返回是否收敛 |
 | `Close()` | 级联回收全部组件并停止调度器 |
-| `Logger()` | 取日志器（`Error` / `Warn` / `Info` 均可替换） |
+| `Logger()` | 日志服务 `LoggerService`：出口表、环形缓冲，以及 `Error` / `Warn` / `Info` / `Debug` 快捷方法 |
 
 ### `Context`
 
@@ -365,6 +406,10 @@ stateDiagram-v2
 
 `State()` · `Err()` · `Config()` · `UID()` · `Update(config, noSave…)` · `OnUpdate(hook(config, noSave) bool)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
 
+### 日志
+
+`LogLevel`（`LevelError` < `LevelWarn` < `LevelInfo` < `LevelDebug`）· `LogMessage` · `Exporter{Levels, Export}` · `LoggerOptions{Name, Level}` · `Logger{Name, Level, Service, Exporter, Error, Warn, Info, Debug}` · `LoggerService{Logger, Exporter, Capture, Silence, Messages, BufferSize, SetBufferSize, Error, Warn, Info, Debug}`
+
 ### 错误值
 
 `ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound` · `ErrDuplicateNext`
@@ -387,7 +432,7 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **65 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **75 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
@@ -429,7 +474,7 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestEffectIterPanicReclaimsYielded` | `iter` 中途 panic 时已 yield 的部分按 LIFO 回收，且 panic 继续上抛 |
 | `TestFailedFiberDoesNotReenterOnDependencyRefresh` | 失败的 fiber 在依赖反复上下线中保持冻结，只有 `Update` 能恢复 |
 
-**声明式配置层（`loader_test.go`，17 项）**
+**声明式配置层（`loader_test.go` 17 项 + `loader_events_test.go` 5 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -443,6 +488,21 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestLoaderLargeLoad` | 1100 入口单次 Load 不死锁 |
 | `TestLoaderIsolateMigration` | 两侧加减 `isolate`（relevant / irrelevant 服务名、共享域引用）与「注销重建」等效 |
 | `TestLoaderIsolateTransfer` | 跨组移动不改变域身份 |
+| `TestLoaderEventSurface` | `entry-init` / `patch-context`（链的两侧都执行）/ `partial-dispose`（`active` 真假两种）/ `config-update` |
+| `TestLoaderEntriesAndWait` | `Entries()` 覆盖全树且顺序稳定；收敛后 `Pending()` 为空（依赖未满足也是稳定态） |
+| `TestLoaderLocate` | 实例（含入口内嵌套的子插件）反查回自己的入口 |
+| `TestLoaderBuiltins` | `cordis:<名字>` 命中内置表，且**不**回落到外部解析器 |
+| `TestLoaderLogs` | `SetLogs` 打开后才按 apply / reload / unload 记录，分组入口自身不记录 |
+
+**日志（`logger_test.go`，5 项）**
+
+| 测试 | 覆盖点 |
+| --- | --- |
+| `TestLoggerNameResolution` | 显式名 > 拦截配置名 > 插件名，且消息带上产出实例 |
+| `TestLoggerLevelFiltering` | 出口阈值优先级 `Levels[名字]` → `Levels[""]` → 日志器自身级别 |
+| `TestLoggerExporterDispose` | 追加出口可注销且幂等，默认出口不受影响 |
+| `TestLoggerBufferIsBoundedAndChronological` | 环形缓冲有界、保序、可缩容，`0` 表示不缓存 |
+| `TestLoggerSilence` | 静音默认出口后缓冲仍照常记录 |
 
 **内部不变量（白盒）**
 

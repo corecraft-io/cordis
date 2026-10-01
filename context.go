@@ -50,6 +50,18 @@ func (c *Context) Reflect() *Reflect   { return c.app.root.reflect }
 // Entry 返回本链所属的声明式入口（无 loader 层时为 nil）。
 func (c *Context) Entry() *Entry { return c.entry }
 
+// Logger 返回绑定本上下文的日志器：名字取显式参数 > 拦截配置
+// （`ctx.Intercept("logger", …)`）> 所属插件名，级别阈值同样可由拦截
+// 配置覆盖（缺省 LevelInfo）。输出的消息带上发起实例的名字与实例号，
+// 便于在同一个进程里区分同插件的多个实例。
+func (c *Context) Logger(name ...string) *Logger {
+	explicit := ""
+	if len(name) > 0 {
+		explicit = name[0]
+	}
+	return c.app.logger.forContext(c, explicit)
+}
+
 // extend 派生子上下文。fiber 非 nil 时子上下文挂载该 fiber
 // （每个 fiber 的 ctx 都是其父 ctx 的扩展层）；isolates/intercepts
 // 为该层的覆盖项，查找沿父链向上；entry 沿链继承。

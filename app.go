@@ -120,13 +120,13 @@ func (s *scheduler) pending() bool {
 type App struct {
 	sched     *scheduler
 	root      *Context
-	logger    *Logger
+	logger    *LoggerService
 	closeOnce sync.Once
 }
 
 // New 创建应用并启动调度器。
 func New() *App {
-	app := &App{sched: newScheduler(), logger: newLogger()}
+	app := &App{sched: newScheduler(), logger: newLoggerService()}
 	app.root = newRootContext(app)
 	return app
 }
