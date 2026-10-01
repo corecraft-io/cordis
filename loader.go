@@ -177,7 +177,6 @@ type Entry struct {
 	ctx      *Context
 	fiber    *Fiber
 	subgroup *EntryGroup // options.Group 时由分组插件建立
-	updating bool        // loader 发起的更新：跳过配置回写
 }
 
 // Options 返回入口的当前配置。
@@ -282,10 +281,11 @@ func (e *Entry) init() {
 	}
 	e.fiber = f
 	e.loader.entryFibers[f] = e
-	// 配置回写：插件运行期自更新配置时同步回入口配置并提交，
-	// 供持久化层（commit 钩子）落盘。
-	f.OnUpdate(func(config any) bool {
-		if e.updating {
+	// 配置回写：插件运行期自更新配置时（noSave 为 false 的那一类）
+	// 同步回入口配置并提交，供持久化层（commit 钩子）落盘。
+	// loader 自己发起的更新带 noSave，故不会在此重复提交。
+	f.OnUpdate(func(config any, noSave bool) bool {
+		if noSave {
 			return true
 		}
 		legacy := e.options
@@ -370,19 +370,16 @@ func (e *Entry) update(options EntryOptions) {
 		if e.options.Group {
 			// 分组入口的任何选项变化都经 Update 触发子入口协调
 			//（禁用级联即在此传播）；分组插件以更新钩子否决自身重启。
-			e.updating = true
-			if err := e.fiber.Update(e.options.Config); err != nil {
+			// noSave：本次更新由 loader 发起，钩子不得回写配置。
+			if err := e.fiber.Update(e.options.Config, true); err != nil {
 				e.loader.ctx.app.logger.Error("entry %s: %v", e.ID(), err)
 			}
-			e.updating = false
 			return
 		}
 		if !reflect.DeepEqual(legacy.Config, options.Config) {
-			e.updating = true
-			if err := e.fiber.Update(e.options.Config); err != nil {
+			if err := e.fiber.Update(e.options.Config, true); err != nil {
 				e.loader.ctx.app.logger.Error("entry %s: %v", e.ID(), err)
 			}
-			e.updating = false
 		}
 		return
 	}
@@ -443,7 +440,7 @@ func init() {
 			}
 			// 更新钩子：子入口列表变化 → 协调子组，否决默认重启。
 			// 陈旧守卫：自身重载后旧钩子仍存留，此时放行默认行为。
-			ctx.Fiber().OnUpdate(func(cfg any) bool {
+			ctx.Fiber().OnUpdate(func(cfg any, _ bool) bool {
 				if entry.subgroup != g {
 					return true
 				}

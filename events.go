@@ -32,10 +32,27 @@ func newLogger() *Logger {
 
 func (a *App) Logger() *Logger { return a.logger }
 
+// Listener 事件监听器。回调收到的 ctx 是分发方上下文（Emit/Serial/…
+// 的调用者）；waterfall 模式还会在参数末尾追加 next。
+type Listener func(ctx *Context, args ...any) any
+
+// ListenOptions 监听器注册选项。
+type ListenOptions struct {
+	// Prepend 把监听器插入注册序头部（默认追加到尾部）。内置分发器
+	// （internal/update 的局部钩子装配器）依赖它取得优先位置。
+	Prepend bool
+	// Global 让监听器绕过 isolate 域过滤——对全部域的同类事件可见。
+	// 内置的 internal/service 事件按域过滤，只有 Global 监听器能观察
+	// 到其它域的服务上下线；internal/* 系列事件本身不带过滤。
+	Global bool
+}
+
+func (o ListenOptions) isZero() bool { return !o.Prepend && !o.Global }
+
 // hook 事件监听器，随注册它的 Fiber 生命周期自动回收。
 type hook struct {
 	ctx      *Context
-	callback func(ctx *Context, args ...any) any
+	callback Listener
 	global   bool
 }
 
@@ -50,35 +67,74 @@ type Events struct {
 }
 
 func newEvents(ctx *Context) *Events {
-	return &Events{ctx: ctx, hooks: make(map[string][]*hook)}
+	e := &Events{ctx: ctx, hooks: make(map[string][]*hook)}
+	// 内置的两枚钩子构成 fiber 局部更新钩子的装配器，注册序有意义，
+	// 不可调换（见 routeInternalUpdate / runLocalUpdateHooks）：
+	//   1) internal/listener —— 注册期扩展点，把非 global 的
+	//      internal/update 监听器改挂到注册方 fiber 的局部链上；
+	//   2) internal/update（global + prepend）—— 分发时先跑该 fiber
+	//      的局部链，再落回真正的 next。
+	if _, err := e.On(ctx, "internal/listener", e.routeInternalUpdate); err != nil {
+		panic(err) // 根上下文必然可用，失败即编码错误
+	}
+	if _, err := e.On(ctx, "internal/update", e.runLocalUpdateHooks,
+		ListenOptions{Prepend: true, Global: true}); err != nil {
+		panic(err)
+	}
+	return e
 }
 
-// On 注册监听器（追加到注册序末尾），返回可手动注销的 Dispose；
-// Fiber 卸载时监听器自动注销。
+// On 注册监听器（默认追加到注册序末尾），返回可手动注销
+// （可重复调用）的 Dispose；Fiber 卸载时监听器自动注销。
+//
+// 注册前先分发 internal/listener：任一监听器返回非 nil 的 Dispose
+// 即接管本次注册（返回值原样转交调用方），内置装配器正是借此把
+// 非 global 的 internal/update 监听器改挂到 fiber 局部链上。
 //
 // 失活校验由 Effect 内部统一执行（assertActive），此处不重复。
-func (e *Events) On(ctx *Context, name string, listener func(ctx *Context, args ...any) any) (Dispose, error) {
-	h := &hook{ctx: ctx, callback: listener}
+func (e *Events) On(ctx *Context, name string, listener Listener, opts ...ListenOptions) (Dispose, error) {
+	var o ListenOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	if err := ctx.fiber.assertActive(); err != nil {
+		return nil, err
+	}
+	if result := e.Bail(ctx, "internal/listener", name, listener, o); result != nil {
+		if d, ok := result.(Dispose); ok && d != nil {
+			return d, nil
+		}
+	}
 	return ctx.fiber.Effect("ctx.on("+name+")", func() (Dispose, error) {
-		e.hooks[name] = append(e.hooks[name], h)
+		h := &hook{ctx: ctx, callback: listener, global: o.Global}
+		e.insert(name, h, o.Prepend)
 		return func() { e.unregister(name, h) }, nil
 	})
 }
 
 // Once 注册一次性监听器，首次触发后自动注销。
-func (e *Events) Once(ctx *Context, name string, listener func(ctx *Context, args ...any) any) (Dispose, error) {
+func (e *Events) Once(ctx *Context, name string, listener Listener, opts ...ListenOptions) (Dispose, error) {
 	var outer Dispose
 	inner, err := e.On(ctx, name, func(c *Context, args ...any) any {
 		if outer != nil {
 			outer()
 		}
 		return listener(c, args...)
-	})
+	}, opts...)
 	if err != nil {
 		return nil, err
 	}
 	outer = inner
 	return inner, nil
+}
+
+// insert 按选项把监听器放入桶：Prepend 走头部，默认走尾部。
+func (e *Events) insert(name string, h *hook, prepend bool) {
+	if !prepend {
+		e.hooks[name] = append(e.hooks[name], h)
+		return
+	}
+	e.hooks[name] = append([]*hook{h}, e.hooks[name]...)
 }
 
 func (e *Events) unregister(name string, h *hook) {
@@ -94,12 +150,16 @@ func (e *Events) unregister(name string, h *hook) {
 	}
 }
 
-// hooksOf 取按注册序排列的监听器。filter 非 nil 时，
+// hooksOf 取按注册序排列的监听器**快照**。filter 非 nil 时，
 // 仅保留 global 或通过过滤的监听器（用于 isolate 域感知分发）。
+//
+// 一律返回副本：分发期间监听器可以注册或注销自己（注销会原地压缩
+// 切片），在活切片上直接遍历会漏掉被顶替的相邻元素——waterfall 还要
+// 在这份快照上逐级 shift，复用活切片更不可能正确。
 func (e *Events) hooksOf(name string, filter func(hookCtx *Context) bool) []*hook {
 	hooks := e.hooks[name]
 	if filter == nil {
-		return hooks
+		return append([]*hook(nil), hooks...)
 	}
 	var out []*hook
 	for _, h := range hooks {
@@ -186,4 +246,94 @@ func call(h *hook, ctx *Context, args []any) (result any, err error) {
 		}
 	}()
 	return h.callback(ctx, args...), nil
+}
+
+// Waterfall 洋葱式分发：每个监听器收到 (args..., next)，调用 next 把
+// 控制权交给链上的下一个监听器，最后一个 next 落到 terminal（nil
+// 表示返回 nil）。监听器不调用 next 即终止分发，其返回值原样传出——
+// internal/update 的「否决本次重载」正是靠这一点表达。
+//
+// next 只在**当前监听器帧**内可用且只能用一次：重复调用，或把 next
+// 保存到外层帧之后再调用，都会 panic ErrDuplicateNext。这是监听器的
+// 编程错误（next 代表"把这次调用继续下去"），必须立刻暴露而不是
+// 静默吞掉。调度器内的调用点（Fiber.Update）会把该 panic 收敛为错误
+// 返回，不会击穿调度器 goroutine。
+func (e *Events) Waterfall(ctx *Context, name string, terminal func() any, args ...any) any {
+	hooks := e.hooksOf(name, ctx.eventFilter)
+	steps := make([]chainStep, len(hooks))
+	for i, h := range hooks {
+		h := h // 显式固化循环变量：闭包捕获不依赖语言版本的循环变量语义
+		steps[i] = func(call []any) any { return h.callback(ctx, call...) }
+	}
+	return chain(steps, terminal, args)
+}
+
+// chainStep 一次链式调用的执行单元：call 以 (args..., next) 调用。
+type chainStep func(call []any) any
+
+// chain 把 steps 串成洋葱链：next 落到下一个 step，走完则落到 terminal。
+func chain(steps []chainStep, terminal func() any, args []any) any {
+	idx := 0
+	var dispatch func() any
+	dispatch = func() any {
+		if idx >= len(steps) {
+			if terminal == nil {
+				return nil
+			}
+			return terminal()
+		}
+		step := steps[idx]
+		idx++
+		called := false
+		call := append(append(make([]any, 0, len(args)+1), args...), func() any {
+			if called {
+				panic(ErrDuplicateNext)
+			}
+			called = true
+			return dispatch()
+		})
+		return step(call)
+	}
+	return dispatch()
+}
+
+// routeInternalUpdate 内置 internal/listener 钩子：把**非 global** 的
+// internal/update 监听器改挂到注册方 fiber 的局部钩子链上。于是
+// 「谁注册的钩子」与「谁的更新该被它拦住」自动一一对应——同一插件
+// 的多个实例互不打扰，这正是官方实现的 internal/listener 路由。
+// 返回非 nil 的 Dispose 即接管本次注册（监听器不再进全局桶）。
+func (e *Events) routeInternalUpdate(ctx *Context, args ...any) any {
+	if len(args) < 3 {
+		return nil
+	}
+	name, _ := args[0].(string)
+	opts, _ := args[2].(ListenOptions)
+	if name != "internal/update" || opts.Global {
+		return nil
+	}
+	listener, ok := args[1].(Listener)
+	if !ok || listener == nil {
+		return nil
+	}
+	return ctx.fiber.addLocalUpdate(listener)
+}
+
+// runLocalUpdateHooks 内置 internal/update 钩子（global + prepend）：
+// 把注册在**本 fiber** 上的局部钩子按注册序串成链，链尾接真正的
+// next（即"替换配置并重启"）。任一局部钩子不调用 next 即否决本次
+// 更新——等价于官方实现的 fiber._hooks 局部链。
+func (e *Events) runLocalUpdateHooks(ctx *Context, args ...any) any {
+	f := ctx.Fiber()
+	if f == nil || len(args) == 0 {
+		return nil
+	}
+	next, _ := args[len(args)-1].(func() any)
+	payload := args[:len(args)-1]
+	hooks := append([]*localUpdateHook(nil), f.localUpdates...)
+	steps := make([]chainStep, len(hooks))
+	for i, h := range hooks {
+		h := h
+		steps[i] = func(call []any) any { return h.fn(ctx, call...) }
+	}
+	return chain(steps, next, payload)
 }

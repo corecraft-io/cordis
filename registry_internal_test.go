@@ -105,10 +105,13 @@ func TestRuntimeRemoveThroughDispose(t *testing.T) {
 		t.Fatalf("应有 50 个实例，实际 %d", len(rt.fibers))
 	}
 
-	// 乱序注销一半，每步都校验自洽。
-	for _, i := range []int{0, 49, 25, 12, 37, 7, 43, 19} {
-		fs[i].Dispose()
-	}
+	// 乱序注销一半，每步都校验自洽。（Dispose 是 Fiber API，
+	// 必须在调度器上下文中调用——测试也不得绕过这条约束。）
+	app.DoSync(func(ctx *Context) {
+		for _, i := range []int{0, 49, 25, 12, 37, 7, 43, 19} {
+			fs[i].Dispose()
+		}
+	})
 	app.Wait()
 	rtConsistent(t, rt)
 	if len(rt.fibers) != 42 {
@@ -116,9 +119,11 @@ func TestRuntimeRemoveThroughDispose(t *testing.T) {
 	}
 
 	// 注销剩余。
-	for _, f := range fs {
-		f.Dispose()
-	}
+	app.DoSync(func(ctx *Context) {
+		for _, f := range fs {
+			f.Dispose()
+		}
+	})
 	app.Wait()
 	rtConsistent(t, rt)
 	if len(rt.fibers) != 0 || len(rt.index) != 0 {

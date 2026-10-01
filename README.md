@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 44 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 57 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -68,20 +68,21 @@ Three layers, matching the diagram:
 
 | File | Lines | Responsibility |
 | --- | --- | --- |
-| `cordis.go` | 93 | Package doc, `FiberState`, error values, `Plugin` |
+| `cordis.go` | 97 | Package doc, `FiberState`, error values, `Plugin` |
 | `app.go` | 225 | `App` host, scheduler, `Wait` / `Close` |
-| `context.go` | 203 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
-| `fiber.go` | 561 | State machine, epoch chasing, effects and LIFO disposal, hot config update |
-| `reflect.go` | 241 | Coeffect store, realm key resolution, reverse dependency index and notifications |
-| `registry.go` | 193 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points |
-| `events.go` | 189 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel`) and `Logger` |
+| `context.go` | 210 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
+| `fiber.go` | 628 | State machine, epoch chasing, effects and LIFO disposal, local update hooks, hot config update |
+| `reflect.go` | 294 | Coeffect store, realm key resolution, reverse dependency index and notifications |
+| `registry.go` | 213 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points |
+| `events.go` | 337 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`), listener routing, `Logger` |
 | `disposable.go` | 72 | Two-phase dispose steps and the order-preserving list |
-| `loader.go` | 788 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
+| `loader.go` | 785 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | End-to-end example covering hot reload, degradation and isolation |
-| `cordis_test.go` | 1078 | Core runtime tests (22 + 1 benchmark) |
+| `cordis_test.go` | 1576 | Core runtime tests (33 + 1 benchmark) |
 | `loader_test.go` | 707 | Loader tests (15 + 1 benchmark) |
-| `index_internal_test.go` | 60 | Reverse index lifecycle invariants (white-box) |
+| `index_internal_test.go` | 411 | Reverse index lifecycle invariants (white-box) |
 | `disposable_internal_test.go` | 125 | Tombstone compaction invariants and benchmarks (1 + 3, white-box) |
+| `registry_internal_test.go` | 145 | `Runtime` add/remove consistency (white-box) |
 
 ---
 
@@ -91,7 +92,7 @@ Three layers, matching the diagram:
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 44 tests
+go test ./...          # 57 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -204,11 +205,40 @@ Declared at the loader layer through `EntryOptions.Isolate`: `true` means a real
 | `Serial` | Serial; the first non-nil result stops dispatch |
 | `Bail` | Like `Serial`, but throws synchronously |
 | `Parallel` | Aggregates all errors (equivalent to serial under one thread) |
+| `Waterfall` | Onion dispatch: each listener receives `(args..., next)`; not calling `next` aborts the chain |
 | `EmitFiltered` | Dispatch with explicit realm filtering |
 
-Built-in events: `internal/plugin` (instance created/disposed), `internal/status` (state transitions), `internal/service` (service up/down).
+`On` / `Once` take optional `ListenOptions`:
 
-### 5.6 Declarative Configuration
+| Option | Effect |
+| --- | --- |
+| `Prepend` | Insert at the head of the registration order (default: append) |
+| `Global` | Bypass isolate-realm filtering — see every realm's event (default: same realm only) |
+
+Dispatch always runs over a **snapshot** of the listener list: a listener that unregisters itself mid-dispatch cannot skip its neighbour, and a listener registered during a dispatch does not join that dispatch.
+
+`Waterfall` is the open-ended extension point (equivalent to the official `waterfall` mode): listeners receive the payload plus a `next` continuation, and the terminal function passed to `Waterfall` is the default behaviour at the end of the chain. Calling `next` twice — including keeping it and calling it from an outer frame — panics with `ErrDuplicateNext`; `Fiber.Update` converts that panic into a returned error so a broken hook cannot take the scheduler goroutine down with it.
+
+Built-in events: `internal/plugin` (instance created/disposed), `internal/status` (state transitions), `internal/service` (service up/down), `internal/update` (hot config update chain), `internal/listener` (registration-time hook).
+
+### 5.6 Hot Config Update
+
+`fiber.Update(config, noSave...)` re-validates the config and then dispatches `internal/update` as a waterfall chain:
+
+```
+global hooks (in registration order) → this fiber's local hooks → default: replace config & restart
+```
+
+| Mechanism | Effect |
+| --- | --- |
+| `ctx.On("internal/update", …)` registered on a fiber's own context | Routed to **that fiber's local hook chain** (`internal/listener` performs the routing), so a hook only ever intercepts its own instance's updates. Prepend/global registration keeps it in the global bucket instead |
+| `fiber.OnUpdate(hook func(config, noSave) bool)` | Convenience wrapper for a local hook; returning `false` takes over the update entirely |
+| Not calling `next` (or returning `false`) | Vetoes the update: neither the config replacement nor the restart happens |
+| `noSave == true` | The update was initiated by the host (loader); hooks must not persist the new config |
+
+Local hooks deliberately **survive unload/reload** (they are not effects), which is why the loader can keep its config write-back hook across hot reloads — and why a hook that outlives its own group instance must guard against staleness.
+
+### 5.7 Declarative Configuration
 
 ```go
 loader := cordis.NewLoader(app, func(name string) (*cordis.Plugin, error) {
@@ -236,7 +266,7 @@ Dispatch rules for configuration changes (`Entry.update`):
 
 - Disable (including cascading) disposes the Fiber and detaches the group subtree.
 - A change to a spatial declaration (`Name` / `Group` / `Inject` / `Isolate` / `Intercept`) **detaches the old subtree synchronously**, disposes the old instance, then reloads fully under the new declaration. Effect reclamation is asynchronous, so the subtree structure must be consistent immediately or the short-id index collides during the rebuild.
-- A change to `Config` alone goes through `Fiber.Update`. If it fails `Validate`, the Fiber enters `failed` and stays on the entry, recovering in place once corrected.
+- A change to `Config` alone goes through `Fiber.Update(config, true)` (`noSave`: an update initiated by the loader never writes back to the entry config). If it fails `Validate`, the Fiber enters `failed` and stays on the entry, recovering in place once corrected.
 - A group entry reconciles its children through update hooks rather than restarting itself; a group config of the wrong type (not `[]EntryOptions`) is logged and the existing children are kept.
 
 ---
@@ -304,6 +334,7 @@ stateDiagram-v2
 | `Provide(name, value, check)` | Registers a service, returning a Fiber-bound `Dispose` |
 | `Set(name, value)` | Updates a value registered by this Fiber |
 | `Effect` / `EffectIter` / `On` / `Once` / `Emit` | Effects and events |
+| `Waterfall(name, terminal, args…)` | Onion dispatch with a `next` continuation chain |
 | `Isolate(name, realm)` / `Intercept(name, cfg)` / `InterceptOf(name)` | Spatial declarations |
 | `Plugin(p, config)` / `Inject(deps, apply)` | Instantiate a component / declare dynamic dependencies |
 | `App()` / `Fiber()` / `Root()` / `Entry()` | Context navigation |
@@ -318,11 +349,11 @@ stateDiagram-v2
 
 ### `Fiber`
 
-`State()` · `Err()` · `Config()` · `UID()` · `Update(config)` · `OnUpdate(hook)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
+`State()` · `Err()` · `Config()` · `UID()` · `Update(config, noSave…)` · `OnUpdate(hook(config, noSave) bool)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
 
 ### Error Values
 
-`ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound`
+`ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound` · `ErrDuplicateNext`
 
 ---
 
@@ -342,11 +373,11 @@ stateDiagram-v2
 
 ## 10. Test Coverage
 
-`go test ./...` → **44 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **57 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 
-**Core runtime (`cordis_test.go`, 22 tests)**
+**Core runtime (`cordis_test.go`, 33 tests)**
 
 | Test | Coverage |
 | --- | --- |
@@ -370,6 +401,15 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestConcurrentExternalCalls` | 8 goroutines mixing `Do`/`DoSync`: no lost or duplicated tasks, strict serialization, honest execution reporting |
 | `TestConcurrentPluginRegistration` | 160 concurrent registrations all converge to `active` |
 | `TestConcurrentCloseWithPosts` | `Close` racing external posts: no deadlock, no panic, idempotent |
+| `TestWaterfallChain` / `TestWaterfallShortCircuit` | onion dispatch: `next` threads the chain, not calling it aborts it, terminal is the default behaviour |
+| `TestWaterfallDuplicateNextPanics` / `TestWaterfallStaleNextPanics` | reusing `next` (same frame or an outer one) panics with `ErrDuplicateNext` |
+| `TestEventPrependOrder` | `ListenOptions{Prepend: true}` inserts at the head |
+| `TestEventDispatchSnapshot` | dispatch runs on a snapshot: self-unregistering listeners cannot skip neighbours, late registrations miss the current dispatch |
+| `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` sees other realms' `internal/service` events |
+| `TestUpdateEventHookScope` | a non-global `internal/update` listener only intercepts its own fiber; global ones see every fiber |
+| `TestUpdateHookNoSaveAndVeto` | `noSave` reaches hooks; returning `false` vetoes config replacement and restart |
+| `TestUpdateHookDuplicateNextIsReported` | a hook misusing `next` yields an error from `Update` instead of killing the scheduler |
+| `TestInternalListenerTakesOver` | `internal/listener` can take over a registration and own its disposal |
 
 **Loader (`loader_test.go`, 15 tests)**
 
@@ -389,6 +429,8 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 `TestReflectIndexLifecycle` (`index_internal_test.go`) — strict track/untrack pairing for the reverse dependency index: disposal, unregistered failure paths, and the index draining to empty after a cascading `Close`.
 
 `TestDisposableCompactionPreservesOrder` (`disposable_internal_test.go`) — compaction actually fires (`order > 8` and `order > 2× live`), and the sort-based rebuild preserves LIFO order.
+
+`TestRuntimeRemoveConsistency` / `TestRuntimeRemoveThroughDispose` (`registry_internal_test.go`) — `Runtime.fibers` / `Runtime.index` stay consistent through out-of-order disposal (the O(1) swap-remove path from ADR-0007), and a cascading `Close` empties both.
 
 **Benchmarks**
 

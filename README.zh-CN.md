@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 44 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 57 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -68,20 +68,21 @@ flowchart TD
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `cordis.go` | 93 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
+| `cordis.go` | 97 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
 | `app.go` | 225 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
-| `context.go` | 203 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
-| `fiber.go` | 561 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、配置热更新 |
-| `reflect.go` | 241 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
-| `registry.go` | 193 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
-| `events.go` | 189 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel`）与 `Logger` |
+| `context.go` | 210 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
+| `fiber.go` | 628 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、局部更新钩子、配置热更新 |
+| `reflect.go` | 294 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
+| `registry.go` | 213 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
+| `events.go` | 337 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）、监听器路由与 `Logger` |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
-| `loader.go` | 788 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
+| `loader.go` | 785 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 1078 | 核心运行时测试（22 项 + 1 基准） |
+| `cordis_test.go` | 1576 | 核心运行时测试（33 项 + 1 基准） |
 | `loader_test.go` | 707 | 声明式配置层测试（15 项 + 1 基准） |
-| `index_internal_test.go` | 60 | 依赖倒排索引的生命周期不变量（白盒） |
+| `index_internal_test.go` | 411 | 依赖倒排索引的生命周期不变量（白盒） |
 | `disposable_internal_test.go` | 125 | 墓碑压缩的不变量与基准（1 项 + 3 基准，白盒） |
+| `registry_internal_test.go` | 145 | `Runtime` 增删一致性（白盒） |
 
 ---
 
@@ -91,7 +92,7 @@ flowchart TD
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 44 项测试
+go test ./...          # 57 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -202,11 +203,40 @@ ctx.Intercept("database", myConfig)   // 供提供者读取的拦截配置
 | `Serial` | 串行，首个返回非 nil 的监听器终止分发 |
 | `Bail` | 同 `Serial`，但同步抛出 panic |
 | `Parallel` | 聚合全部错误（单线程下等价于串行） |
+| `Waterfall` | 洋葱式分发：每个监听器收到 `(args..., next)`，不调用 `next` 即终止整条链 |
 | `EmitFiltered` | 带显式域过滤规则分发 |
 
-内置事件：`internal/plugin`（实例创建/注销）、`internal/status`（状态迁移）、`internal/service`（服务上下线）。
+`On` / `Once` 可传 `ListenOptions`：
 
-### 5.6 声明式配置层
+| 选项 | 作用 |
+| --- | --- |
+| `Prepend` | 插入注册序头部（默认追加到尾部） |
+| `Global` | 绕过 isolate 域过滤——对全部域的同类事件可见（默认仅同域） |
+
+分发自始至终在监听器列表的**快照**上进行：分发期间自注销的监听器不会跳过相邻监听器，分发期间新注册的监听器不参与本次分发。
+
+`Waterfall` 是开放扩展点（对应官方实现的 waterfall 模式）：监听器除载荷外还会收到 `next` 续延，`Waterfall` 的 `terminal` 参数即链尾的默认行为。`next` 重复调用——包括存到外层帧再调用——会 panic `ErrDuplicateNext`；`Fiber.Update` 会把该 panic 收敛为错误返回，钩子写错不会击穿调度器 goroutine。
+
+内置事件：`internal/plugin`（实例创建/注销）、`internal/status`（状态迁移）、`internal/service`（服务上下线）、`internal/update`（配置热更新链）、`internal/listener`（注册期扩展点）。
+
+### 5.6 配置热更新
+
+`fiber.Update(config, noSave...)` 先校验新配置，再把 `internal/update` 作为洋葱链分发：
+
+```
+全局钩子（注册序） → 本 fiber 的局部钩子 → 默认行为：替换配置并重启
+```
+
+| 机制 | 作用 |
+| --- | --- |
+| 在 fiber 自己的上下文上 `ctx.On("internal/update", …)` | 经 `internal/listener` 路由到**该 fiber 的局部钩子链**，因此只拦得住本实例的更新；带 Prepend/Global 注册则留在全局桶 |
+| `fiber.OnUpdate(hook func(config, noSave) bool)` | 局部钩子的便捷封装；返回 `false` 即完全接管本次更新 |
+| 不调用 `next`（或返回 `false`） | 否决本次更新：既不替换配置也不重启 |
+| `noSave == true` | 本次更新由宿主（loader）发起，钩子不得把配置回写为持久化配置 |
+
+局部钩子**刻意随卸载/重载存续**（不作为效果登记），loader 的配置回写钩子正是靠它跨热重载存活；反过来，比自己的分组实例活得更久的钩子必须自带陈旧守卫。
+
+### 5.7 声明式配置层
 
 ```go
 loader := cordis.NewLoader(app, func(name string) (*cordis.Plugin, error) {
@@ -234,7 +264,7 @@ loader.Load([]cordis.EntryOptions{
 
 - 禁用（含级联）→ 注销 Fiber 并摘下分组子树；
 - 空间声明变化（`Name` / `Group` / `Inject` / `Isolate` / `Intercept`）→ **同步摘下旧子树**、注销旧实例，再以新声明完整重载（旧实例的效果回收是异步的，子树结构必须立即一致，否则重建时短 ID 索引冲突）；
-- 仅 `Config` 变化 → 走 `Fiber.Update` 热重载；配置未过 `Validate` 时 Fiber 进入 `failed` 并保留在入口上，修正后原地恢复；
+- 仅 `Config` 变化 → 走 `Fiber.Update(config, true)`（`noSave`：loader 发起的更新不回写入口配置）热重载；配置未过 `Validate` 时 Fiber 进入 `failed` 并保留在入口上，修正后原地恢复；
 - 分组入口 → 通过更新钩子协调子入口，而非重启自身；分组配置类型错误（非 `[]EntryOptions`）记日志并保留现有子入口。
 
 ---
@@ -316,11 +346,11 @@ stateDiagram-v2
 
 ### `Fiber`
 
-`State()` · `Err()` · `Config()` · `UID()` · `Update(config)` · `OnUpdate(hook)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
+`State()` · `Err()` · `Config()` · `UID()` · `Update(config, noSave…)` · `OnUpdate(hook(config, noSave) bool)` · `Dispose()` · `Effect(label, fn)` · `EffectIter(label, iter)`
 
 ### 错误值
 
-`ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound`
+`ErrInactiveEffect` · `ErrServiceDuplicate` · `ErrServiceNotFound` · `ErrInvalidPlugin` · `ErrEntryNotFound` · `ErrDuplicateNext`
 
 ---
 
@@ -340,11 +370,11 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **44 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **57 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
-**核心运行时（`cordis_test.go`，22 项）**
+**核心运行时（`cordis_test.go`，33 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -368,6 +398,15 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestConcurrentExternalCalls` | 8 goroutine 混合 `Do`/`DoSync`：任务不丢失不重复、调度严格串行、执行结果如实上报 |
 | `TestConcurrentPluginRegistration` | 并发注册 160 个实例，全部收敛为 `active` |
 | `TestConcurrentCloseWithPosts` | `Close` 与外部投递并发：无死锁、无 panic、幂等 |
+| `TestWaterfallChain` / `TestWaterfallShortCircuit` | 洋葱式分发：`next` 串起整条链，不调用 `next` 即中断，`terminal` 是链尾默认行为 |
+| `TestWaterfallDuplicateNextPanics` / `TestWaterfallStaleNextPanics` | 重复使用 `next`（同帧或存到外层帧）panic `ErrDuplicateNext` |
+| `TestEventPrependOrder` | `ListenOptions{Prepend: true}` 插入注册序头部 |
+| `TestEventDispatchSnapshot` | 分发在快照上进行：自注销不跳过相邻监听器，分发中登记的监听器本次不生效 |
+| `TestEventGlobalBypassesRealmFilter` | `ListenOptions{Global: true}` 可观察其它域的 `internal/service` 事件 |
+| `TestUpdateEventHookScope` | 非 global 的 `internal/update` 监听器只拦本 fiber；global 的对所有 fiber 生效 |
+| `TestUpdateHookNoSaveAndVeto` | `noSave` 抵达钩子；返回 `false` 即否决配置替换与重启 |
+| `TestUpdateHookDuplicateNextIsReported` | 钩子误用 `next` 时 `Update` 返回错误而非击穿调度器 |
+| `TestInternalListenerTakesOver` | `internal/listener` 可接管注册，并自行负责注销 |
 
 **声明式配置层（`loader_test.go`，15 项）**
 
@@ -387,6 +426,8 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 `TestReflectIndexLifecycle`（`index_internal_test.go`）—— 依赖倒排索引的 track/untrack 严格配对：注销、未注册失败路径与 `Close` 级联后索引回空。
 
 `TestDisposableCompactionPreservesOrder`（`disposable_internal_test.go`）—— 墓碑压缩确实触发（`order > 8` 且 `order > 2×存活数`），且按 `id` 排序重建后 LIFO 序不破。
+
+`TestRuntimeRemoveConsistency` / `TestRuntimeRemoveThroughDispose`（`registry_internal_test.go`）—— 乱序注销下 `Runtime.fibers` / `Runtime.index` 始终自洽（ADR-0007 的 O(1) 交换删除路径），`Close` 级联后两者同时清空。
 
 **基准**
 

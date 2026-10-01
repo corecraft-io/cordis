@@ -166,18 +166,25 @@ func (c *Context) EffectIter(label string, iter func(yield func(Dispose))) Dispo
 }
 
 // On 注册事件监听器，随当前 Fiber 卸载自动回收（见 Events.On）。
-func (c *Context) On(name string, listener func(ctx *Context, args ...any) any) (Dispose, error) {
-	return c.app.root.events.On(c, name, listener)
+// opts 可指定 Prepend（插入注册序头部）与 Global（绕过 isolate 域过滤）。
+func (c *Context) On(name string, listener Listener, opts ...ListenOptions) (Dispose, error) {
+	return c.app.root.events.On(c, name, listener, opts...)
 }
 
 // Once 注册一次性监听器（见 Events.Once）。
-func (c *Context) Once(name string, listener func(ctx *Context, args ...any) any) (Dispose, error) {
-	return c.app.root.events.Once(c, name, listener)
+func (c *Context) Once(name string, listener Listener, opts ...ListenOptions) (Dispose, error) {
+	return c.app.root.events.Once(c, name, listener, opts...)
 }
 
 // Emit 同步分发事件。
 func (c *Context) Emit(name string, args ...any) {
 	c.app.root.events.Emit(c, name, args...)
+}
+
+// Waterfall 洋葱式分发事件（见 Events.Waterfall）：terminal 是链尾
+// 的默认行为，监听器不调用 next 即终止分发。
+func (c *Context) Waterfall(name string, terminal func() any, args ...any) any {
+	return c.app.root.events.Waterfall(c, name, terminal, args...)
 }
 
 // Plugin 在当前上下文实例化插件（见 Registry.Plugin）。

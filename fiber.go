@@ -36,8 +36,10 @@ func (e epoch) equal(o epoch) bool {
 
 var inactiveEpoch = epoch{inactive: true}
 
-type updateHook struct {
-	fn func(config any) bool
+// localUpdateHook 一个 fiber 局部 internal/update 钩子。
+// 以指针保存：注销时按指针摘除（函数值不可比较）。
+type localUpdateHook struct {
+	fn Listener
 }
 
 // Fiber 是组件的运行时实例（论文 §4 的 component instance）：
@@ -60,8 +62,12 @@ type Fiber struct {
 	deps        map[string]*impl // 当前满足的依赖（对应 _store）
 	store       map[string]*impl // 对外可见服务快照；nil 表示未加载
 	disposables *disposableList
-	updateHooks []*updateHook
-	dispose     Dispose // 注销本 fiber 的清理函数（plugin 注册时生成）
+	// localUpdates 是注册在**本 fiber** 上的 internal/update 钩子
+	// （注册序）。刻意不随卸载回收：Update 之后钩子仍须存活，否则
+	// 宿主注册的配置回写钩子会在第一次热重载后就消失。随 fiber
+	// 注销清空（见 Registry 的注销步骤）。
+	localUpdates []*localUpdateHook
+	dispose      Dispose // 注销本 fiber 的清理函数（plugin 注册时生成）
 
 	err         error
 	ep          epoch
@@ -515,16 +521,51 @@ func (f *Fiber) safeDispose(label string, d Dispose) {
 // 配置热更新
 // ---------------------------------------------------------------------------
 
-// OnUpdate 注册 fiber 局部的更新钩子。钩子返回 false 表示
-// 已完全接管本次更新（否决默认的「替换配置并重启」行为）。
-// Group 组件借此将更新转发给子 entry 集合。
-func (f *Fiber) OnUpdate(hook func(config any) bool) Dispose {
-	h := &updateHook{fn: hook}
-	f.updateHooks = append(f.updateHooks, h)
+// OnUpdate 注册 fiber 局部的更新钩子（等价于在本 fiber 上注册一个
+// 非 global 的 internal/update 监听器）：只在本实例 Update 时触发，
+// 不会拦到同插件的其它实例。
+//
+// 钩子收到解析后的新配置与 noSave 标志（true 表示本次更新由宿主发起，
+// 钩子不得把配置回写为持久化配置）；返回 false 表示已完全接管本次
+// 更新——否决默认的「替换配置并重启」行为。Group 组件借此把更新
+// 转发给子 entry 集合。
+//
+// 钩子链按注册序执行，任一枚返回 false 即终止其后全部钩子与默认行为。
+func (f *Fiber) OnUpdate(hook func(config any, noSave bool) bool) Dispose {
+	return f.addLocalUpdate(func(ctx *Context, args ...any) any {
+		var (
+			cfg    any
+			noSave bool
+			next   func() any
+		)
+		if len(args) > 0 {
+			cfg = args[0]
+		}
+		if len(args) > 1 {
+			noSave, _ = args[1].(bool)
+		}
+		if len(args) > 0 {
+			next, _ = args[len(args)-1].(func() any)
+		}
+		if !hook(cfg, noSave) {
+			return nil
+		}
+		if next == nil {
+			return nil
+		}
+		return next()
+	})
+}
+
+// addLocalUpdate 登记一个 fiber 局部 internal/update 监听器，
+// 返回从链上摘除它的 Dispose（幂等）。
+func (f *Fiber) addLocalUpdate(listener Listener) Dispose {
+	h := &localUpdateHook{fn: listener}
+	f.localUpdates = append(f.localUpdates, h)
 	return func() {
-		for i, cur := range f.updateHooks {
+		for i, cur := range f.localUpdates {
 			if cur == h {
-				f.updateHooks = append(f.updateHooks[:i], f.updateHooks[i+1:]...)
+				f.localUpdates = append(f.localUpdates[:i], f.localUpdates[i+1:]...)
 				return
 			}
 		}
@@ -533,7 +574,17 @@ func (f *Fiber) OnUpdate(hook func(config any) bool) Dispose {
 
 // Update 以新配置热重载组件：替换配置、清除错误、
 // 走一遍完整的卸载-重载循环（论文 §5 的 HMR 机制）。
-func (f *Fiber) Update(config any) error {
+//
+// config 先过一遍 Validate；随后分发 internal/update（洋葱链：
+// 全局钩子 → 本 fiber 的局部钩子 → 默认重启），任一钩子不调用 next
+// 即否决重启。noSave 为 true 表示本次更新由宿主（loader）发起，
+// 钩子不应把新配置回写为持久化配置——对应官方实现的
+// fiber.update(config, noSave)。
+//
+// 钩子链中的编程错误（next 重复调用）与 panic 都收敛为错误返回：
+// Update 常在调度器任务内部被调用，让 panic 逃逸会击穿调度器
+// goroutine。
+func (f *Fiber) Update(config any, noSave ...bool) error {
 	if err := f.assertActive(); err != nil {
 		return err
 	}
@@ -541,15 +592,31 @@ func (f *Fiber) Update(config any) error {
 	if err != nil {
 		return err
 	}
-	for _, hook := range append([]*updateHook(nil), f.updateHooks...) {
-		if !hook.fn(cfg) {
-			return nil // 钩子已接管
-		}
+	skip := len(noSave) > 0 && noSave[0]
+	var hookErr error
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				return
+			}
+			if err, ok := r.(error); ok {
+				hookErr = fmt.Errorf("internal/update of %s: %w", f.name(), err)
+				return
+			}
+			hookErr = fmt.Errorf("internal/update of %s: %v", f.name(), r)
+		}()
+		f.ctx.Waterfall("internal/update", func() any {
+			f.config = cfg
+			f.err = nil
+			f.restart()
+			return nil
+		}, cfg, skip)
+	}()
+	if hookErr != nil {
+		f.app.logger.Error("plugin %s update: %v", f.name(), hookErr)
 	}
-	f.config = cfg
-	f.err = nil
-	f.restart()
-	return nil
+	return hookErr
 }
 
 func (f *Fiber) restart() {

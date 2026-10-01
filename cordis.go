@@ -78,6 +78,10 @@ var (
 	ErrServiceNotFound = errors.New("cordis: service not found")
 	// ErrInvalidPlugin Plugin.Apply 为 nil。
 	ErrInvalidPlugin = errors.New("cordis: invalid plugin, apply must not be nil")
+	// ErrDuplicateNext waterfall 链上的 next 在同一次调用帧内被使用了
+	// 两次（含把 next 保存到外层帧后再调用）。这是监听器的编程错误，
+	// 对应官方实现的 "next() called multiple times"。
+	ErrDuplicateNext = errors.New("cordis: next() called multiple times")
 )
 
 // Plugin 描述一个可组合组件（论文中的 component definition）。

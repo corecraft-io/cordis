@@ -1,6 +1,7 @@
 package cordis_test
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,6 +27,15 @@ func newHarness(t *testing.T) *harness {
 func (h *harness) run(f func(ctx *cordis.Context)) {
 	h.app.DoSync(f)
 	h.app.Wait()
+}
+
+// doSync 在调度器上下文中执行 f 并返回其结果，供需要在调度器内
+// recover（如断言 panic）或取值的用例使用。
+func (h *harness) doSync(f func(ctx *cordis.Context) any) any {
+	var out any
+	h.app.DoSync(func(ctx *cordis.Context) { out = f(ctx) })
+	h.app.Wait()
+	return out
 }
 
 // states 记录 fiber 的状态迁移序列（internal/status 事件）。
@@ -1031,6 +1041,494 @@ func TestConcurrentCloseWithPosts(t *testing.T) {
 	if app.DoSync(func(*cordis.Context) {}) {
 		t.Fatal("DoSync must report false after Close")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 洋葱式分发（waterfall）与事件注册选项
+// ---------------------------------------------------------------------------
+
+// nextOf 取出 waterfall 链上追加在参数末尾的 next。
+// （链装配保证它必然存在且类型正确，断言失败即实现与测试脱节。）
+func nextOf(args []any) func() any {
+	if len(args) == 0 {
+		panic("waterfall: listener received no next argument")
+	}
+	next, ok := args[len(args)-1].(func() any)
+	if !ok {
+		panic(fmt.Sprintf("waterfall: last argument is %T, want func() any", args[len(args)-1]))
+	}
+	return next
+}
+
+func TestWaterfallChain(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var order []string
+	h.run(func(ctx *cordis.Context) {
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			order = append(order, "a")
+			return args[0].(int) + nextOf(args)().(int)
+		})
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			order = append(order, "b")
+			return args[0].(int) + nextOf(args)().(int)
+		})
+		// terminal 是链尾的默认行为：两个监听器各自 +2 之和。
+		got := ctx.Waterfall("test/waterfall", func() any { return 2 }, 1)
+		if got != 4 {
+			t.Fatalf("chain result: %v, want 4", got)
+		}
+		if fmt.Sprint(order) != fmt.Sprint([]string{"a", "b"}) {
+			t.Fatalf("chain order: %v", order)
+		}
+	})
+}
+
+func TestWaterfallShortCircuit(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	// 不调用 next 的监听器终止分发：链上其后的一切（含 terminal）都不执行。
+	var order []string
+	h.run(func(ctx *cordis.Context) {
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			order = append(order, "a")
+			return args[0].(int) + nextOf(args)().(int)
+		})
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			order = append(order, "stop")
+			return args[0].(int)
+		})
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			order = append(order, "unreachable")
+			return nextOf(args)()
+		})
+		got := ctx.Waterfall("test/waterfall", func() any {
+			order = append(order, "terminal")
+			return 2
+		}, 1)
+		// 完整链会是 1+2=3；short-circuit 后链尾不可达，只剩 1+1=2。
+		if got != 2 {
+			t.Fatalf("short-circuit result: %v, want 2", got)
+		}
+		if fmt.Sprint(order) != fmt.Sprint([]string{"a", "stop"}) {
+			t.Fatalf("short-circuit order: %v", order)
+		}
+	})
+
+	// terminal 可省略：链走完即返回 nil。
+	h.run(func(ctx *cordis.Context) {
+		ctx.On("test/empty", func(_ *cordis.Context, args ...any) any { return nextOf(args)() })
+		if got := ctx.Waterfall("test/empty", nil, 1); got != nil {
+			t.Fatalf("nil terminal: %v, want nil", got)
+		}
+	})
+}
+
+func TestWaterfallDuplicateNextPanics(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var terminalCalls int
+	err := h.doSync(func(ctx *cordis.Context) (r any) {
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			next := nextOf(args)
+			next()
+			return next() // 同一帧内第二次调用 → 编程错误
+		})
+		defer func() {
+			r = recover()
+		}()
+		return ctx.Waterfall("test/waterfall", func() any { terminalCalls++; return 1 }, 1)
+	})
+	if !errors.Is(asError(err), cordis.ErrDuplicateNext) {
+		t.Fatalf("duplicate next: %v, want ErrDuplicateNext", err)
+	}
+	if terminalCalls != 1 {
+		t.Fatalf("terminal ran %d times, want 1", terminalCalls)
+	}
+}
+
+func TestWaterfallStaleNextPanics(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	// 把 next 存到外层帧再调用，等同于重复调用：外层帧的控制权
+	// 早已交给下一个监听器，续用会让链被走两遍。
+	var calls []string
+	err := h.doSync(func(ctx *cordis.Context) (r any) {
+		var outerNext func() any
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			outerNext = nextOf(args)
+			calls = append(calls, "first")
+			return outerNext()
+		})
+		ctx.On("test/waterfall", func(_ *cordis.Context, args ...any) any {
+			calls = append(calls, "second")
+			return nextOf(args)()
+		})
+		defer func() {
+			r = recover()
+		}()
+		return ctx.Waterfall("test/waterfall", func() any {
+			calls = append(calls, "terminal")
+			return outerNext()
+		}, 1)
+	})
+	if !errors.Is(asError(err), cordis.ErrDuplicateNext) {
+		t.Fatalf("stale next: %v, want ErrDuplicateNext", err)
+	}
+	if fmt.Sprint(calls) != fmt.Sprint([]string{"first", "second", "terminal"}) {
+		t.Fatalf("stale next calls: %v", calls)
+	}
+}
+
+// asError 把 recover 得到的值还原为 error（非 error 的 panic 值返回 nil）。
+func asError(v any) error {
+	err, _ := v.(error)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// 事件注册选项：prepend / global
+// ---------------------------------------------------------------------------
+
+func TestEventPrependOrder(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var order []string
+	h.run(func(ctx *cordis.Context) {
+		ctx.On("e", func(*cordis.Context, ...any) any { order = append(order, "tail"); return nil })
+		ctx.On("e", func(*cordis.Context, ...any) any { order = append(order, "head1"); return nil },
+			cordis.ListenOptions{Prepend: true})
+		ctx.On("e", func(*cordis.Context, ...any) any { order = append(order, "head2"); return nil },
+			cordis.ListenOptions{Prepend: true})
+		ctx.Emit("e")
+	})
+	if fmt.Sprint(order) != fmt.Sprint([]string{"head2", "head1", "tail"}) {
+		t.Fatalf("prepend order: %v", order)
+	}
+}
+
+// TestEventDispatchSnapshot 分发在监听器列表的**快照**上进行：
+// 分发期间的自注销不得跳过相邻监听器，新注册的监听器本次不参与。
+func TestEventDispatchSnapshot(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var (
+		order []string
+		late  int
+	)
+	h.run(func(ctx *cordis.Context) {
+		var disposeA cordis.Dispose
+		d, err := ctx.On("s", func(c *cordis.Context, _ ...any) any {
+			order = append(order, "A")
+			disposeA() // 自注销：原地压缩监听器桶
+			_, _ = c.On("s", func(*cordis.Context, ...any) any { late++; return nil })
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		disposeA = d
+		if _, err := ctx.On("s", func(*cordis.Context, ...any) any {
+			order = append(order, "B")
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx.Emit("s")
+		if fmt.Sprint(order) != fmt.Sprint([]string{"A", "B"}) {
+			t.Fatalf("dispatch snapshot order: %v", order)
+		}
+		if late != 0 {
+			t.Fatalf("listener registered during dispatch ran %d times, want 0", late)
+		}
+
+		// 第二次分发：A 已注销，分发中登记的监听器此时才生效。
+		order = nil
+		ctx.Emit("s")
+		if fmt.Sprint(order) != fmt.Sprint([]string{"B"}) || late != 1 {
+			t.Fatalf("second dispatch: %v late=%d", order, late)
+		}
+	})
+}
+
+// TestEventGlobalBypassesRealmFilter 域内事件（internal/service）默认
+// 只送达同域监听器；Global 监听器绕过域过滤，观察全部域。
+func TestEventGlobalBypassesRealmFilter(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var scoped, global int
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/service", func(*cordis.Context, ...any) any {
+			scoped++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ctx.On("internal/service", func(*cordis.Context, ...any) any {
+			global++
+			return nil
+		}, cordis.ListenOptions{Global: true}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// 默认域的服务：两种监听器都应收到。
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Provide("db", "root-dsn", nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if scoped != 1 || global != 1 {
+		t.Fatalf("default realm: scoped=%d global=%d, want 1/1", scoped, global)
+	}
+
+	// 隔离域的服务：根域监听器看不见，Global 监听器看得见。
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Isolate("db", "tenant-a").Provide("db", "tenant-dsn", nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if scoped != 1 {
+		t.Fatalf("scoped listener saw %d events from another realm, want 1 (unchanged)", scoped)
+	}
+	if global != 2 {
+		t.Fatalf("global listener saw %d events, want 2", global)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// internal/update：fiber 局部更新钩子
+// ---------------------------------------------------------------------------
+
+// TestUpdateEventHookScope 非 global 的 internal/update 监听器只拦得住
+// **注册它的那个 fiber**；global 的则对所有 fiber 生效。
+//
+// 判别顺序很重要：先更新**另一个** fiber——被路由到局部链的监听器
+// 此时必须毫无反应。若它落进全局桶，这一次就会误触发（而它随本
+// fiber 卸载而回收后，再更新本 fiber 反而看不出差别）。
+func TestUpdateEventHookScope(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var (
+		applied  []int
+		scoped   int
+		global   int
+		firstCfg = 1
+	)
+	// ownerCtx 是首个实例自己的上下文（在 Apply 内捕获）。
+	var ownerCtx *cordis.Context
+	p := &cordis.Plugin{
+		Name: "p",
+		Apply: func(ctx *cordis.Context, config any) error {
+			applied = append(applied, config.(int))
+			if config.(int) != firstCfg {
+				return nil
+			}
+			ownerCtx = ctx
+			// 非 global：按官方语义应被路由到本 fiber 的局部钩子链。
+			_, err := ctx.On("internal/update", func(_ *cordis.Context, args ...any) any {
+				scoped++
+				return nextOf(args)()
+			})
+			return err
+		},
+	}
+
+	var first, second *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/update", func(_ *cordis.Context, args ...any) any {
+			global++
+			return nextOf(args)()
+		}, cordis.ListenOptions{Global: true}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		first, err = ctx.Plugin(p, firstCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err = ctx.Plugin(p, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if ownerCtx == nil {
+		t.Fatal("first instance never captured its context")
+	}
+
+	// 另一个 fiber 的更新：局部钩子不得介入，global 钩子应当到场。
+	h.run(func(_ *cordis.Context) { _ = second.Update(22) })
+	if applied[len(applied)-1] != 22 {
+		t.Fatalf("second fiber did not reload: %v", applied)
+	}
+	if scoped != 0 {
+		t.Fatalf("scoped hook fired for a foreign fiber: %d", scoped)
+	}
+	if global != 1 {
+		t.Fatalf("global hook count after foreign update: %d, want 1", global)
+	}
+
+	// 本 fiber 的更新：局部钩子与 global 钩子各一次，重启照常发生。
+	h.run(func(_ *cordis.Context) { _ = first.Update(11) })
+	if applied[len(applied)-1] != 11 {
+		t.Fatalf("first fiber did not reload: %v", applied)
+	}
+	if scoped != 1 {
+		t.Fatalf("scoped hook count: %d, want 1", scoped)
+	}
+	if global != 2 {
+		t.Fatalf("global hook count: %d, want 2", global)
+	}
+}
+
+// TestUpdateHookNoSaveAndVeto noSave 标志随链传递；钩子返回 false 即
+// 接管本次更新：既不重启组件，也不替换配置。
+func TestUpdateHookNoSaveAndVeto(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var (
+		applied []string
+		flags   []bool
+	)
+	p := &cordis.Plugin{
+		Name: "p",
+		Apply: func(_ *cordis.Context, config any) error {
+			applied = append(applied, config.(string))
+			return nil
+		},
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.OnUpdate(func(_ any, noSave bool) bool {
+			flags = append(flags, noSave)
+			return true
+		})
+	})
+	// 每次 Update 都要等它收敛到下一次 Apply，否则同一批任务里多次
+	// Update 只会以最后一次配置加载一次。
+	h.run(func(_ *cordis.Context) { _ = f.Update("b") })       // 组件自更新
+	h.run(func(_ *cordis.Context) { _ = f.Update("c", true) }) // 宿主发起
+	if fmt.Sprint(flags) != fmt.Sprint([]bool{false, true}) {
+		t.Fatalf("noSave flags: %v", flags)
+	}
+	if fmt.Sprint(applied) != fmt.Sprint([]string{"a", "b", "c"}) {
+		t.Fatalf("reload sequence: %v", applied)
+	}
+
+	// 接管：钩子返回 false，重启与配置替换都不发生。
+	h.run(func(_ *cordis.Context) {
+		f.OnUpdate(func(any, bool) bool { return false })
+		if err := f.Update("d"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if fmt.Sprint(applied) != fmt.Sprint([]string{"a", "b", "c"}) {
+		t.Fatalf("vetoed update still reloaded: %v", applied)
+	}
+	if f.Config() != "c" {
+		t.Fatalf("vetoed update replaced config: %v", f.Config())
+	}
+	if f.State() != cordis.StateActive {
+		t.Fatalf("vetoed update changed state: %v", f.State())
+	}
+}
+
+// TestUpdateHookDuplicateNextIsReported 钩子链中的 next 误用不得击穿
+// 调度器：Update 把它收敛为错误返回，应用继续可用。
+func TestUpdateHookDuplicateNextIsReported(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	p := &cordis.Plugin{
+		Name:  "p",
+		Apply: func(*cordis.Context, any) error { return nil },
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/update", func(_ *cordis.Context, args ...any) any {
+			next := nextOf(args)
+			next()
+			return next()
+		}, cordis.ListenOptions{Global: true}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		f, err = ctx.Plugin(p, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	var err error
+	h.run(func(_ *cordis.Context) { err = f.Update("b") })
+	if !errors.Is(err, cordis.ErrDuplicateNext) {
+		t.Fatalf("update error: %v, want ErrDuplicateNext", err)
+	}
+	if f.State() != cordis.StateActive {
+		t.Fatalf("fiber state after bad hook: %v", f.State())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// internal/listener：注册期扩展点
+// ---------------------------------------------------------------------------
+
+// TestInternalListenerTakesOver 监听器可在注册期接管注册：返回自定义
+// Dispose 后，被注册的监听器不再进入事件桶，注销由接管方负责。
+func TestInternalListenerTakesOver(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var (
+		handled int
+		fired   int
+		revoked int
+	)
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.On("internal/listener", func(_ *cordis.Context, args ...any) any {
+			name, _ := args[0].(string)
+			if name != "custom/event" {
+				return nil
+			}
+			handled++
+			return cordis.Dispose(func() { revoked++ })
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		d, err := ctx.On("custom/event", func(*cordis.Context, ...any) any { fired++; return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx.Emit("custom/event")
+		if handled != 1 {
+			t.Fatalf("internal/listener not dispatched: %d", handled)
+		}
+		if fired != 0 {
+			t.Fatalf("taken-over listener still registered into the bucket: %d", fired)
+		}
+		d() // 接管方返回的注销函数原样转交调用方
+		if revoked != 1 {
+			t.Fatalf("custom dispose: %d", revoked)
+		}
+	})
 }
 
 // BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明

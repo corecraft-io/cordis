@@ -146,6 +146,7 @@ func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[
 			run: func() {
 				f.disposed = true
 				f.uid = 0
+				f.localUpdates = nil     // 局部更新钩子随实例终结
 				r.ctx.reflect.untrack(f) // 依赖倒排索引随实例注销
 				f.ctx.Emit("internal/plugin", f)
 				if _, ok := r.runtimes[p]; ok {
