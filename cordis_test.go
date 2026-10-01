@@ -1968,6 +1968,164 @@ func TestServiceReadWriteInterception(t *testing.T) {
 	})
 }
 
+// TestFiberEffectsIntrospection Effects() 按注册序给出仍生效的
+// 效果标签：用于断言"注销后不残留效果"（官方 getEffects 的用途，
+// 差别见方法注释：本实现给出平铺的标签列表，不是带 children 的树）。
+func TestFiberEffectsIntrospection(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	p := &cordis.Plugin{
+		Name: "holder",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			for _, label := range []string{"conn", "listener", "timer"} {
+				if _, err := ctx.Effect(label, func() (cordis.Dispose, error) {
+					return func() {}, nil
+				}); err != nil {
+					return err
+				}
+			}
+			// 增量效果也登记为一个条目（标签即传入的 label）。
+			ctx.EffectIter("batch", func(yield func(cordis.Dispose)) {
+				yield(func() {})
+				yield(func() {})
+			})
+			return nil
+		},
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	want := []string{"conn", "listener", "timer", "batch"}
+	if got := f.Effects(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Effects(): %v, want %v", got, want)
+	}
+
+	// 注销后为空（也可能整体卸载，两种情况下都不该残留标签）。
+	h.run(func(*cordis.Context) { f.Dispose() })
+	if got := f.Effects(); len(got) != 0 {
+		t.Fatalf("effects after dispose: %v", got)
+	}
+}
+
+// TestFiberRestart Restart 走一遍完整重载但不换配置、不清错误；
+// 失败的实例目标视图被冻结，Restart 对它无效（只有 Update 能恢复）。
+func TestFiberRestart(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var applied []string
+	p := &cordis.Plugin{
+		Name:  "p",
+		Apply: func(_ *cordis.Context, config any) error { applied = append(applied, fmt.Sprint(config)); return nil },
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	h.run(func(*cordis.Context) {
+		if err := f.Restart(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if fmt.Sprint(applied) != fmt.Sprint([]string{"a", "a"}) {
+		t.Fatalf("restart sequence: %v", applied)
+	}
+	if f.Config() != "a" || f.State() != cordis.StateActive {
+		t.Fatalf("state after restart: config=%v state=%v", f.Config(), f.State())
+	}
+
+	// 失败实例的 Restart 不重入（配置与状态都不变）。
+	fail := true
+	flaky := &cordis.Plugin{
+		Name: "flaky",
+		Apply: func(*cordis.Context, any) error {
+			if fail {
+				return errors.New("boom")
+			}
+			return nil
+		},
+	}
+	var bf *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		bf, _ = ctx.Plugin(flaky, nil)
+	})
+	h.run(func(*cordis.Context) { _ = bf.Restart() })
+	if bf.State() != cordis.StateFailed {
+		t.Fatalf("restart must not revive a failed fiber: %v", bf.State())
+	}
+}
+
+// TestContextIsAndInjectList 两个小对齐项：`Is` 判断上下文身份（官方
+// Context.is），`InjectList` 表达官方的 inject 数组形式（值均为 nil，
+// 即必选依赖、无附加拦截配置）。
+func TestContextIsAndInjectList(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	// 断言放在调度器外：t.Fatal 不能在调度 goroutine 里调用（Goexit
+	// 会直接终结调度器，后续步骤会连带着一起假失败）。
+	var captured *cordis.Context
+	h.run(func(ctx *cordis.Context) { captured = ctx })
+	if !cordis.Is(captured) {
+		t.Fatal("Is(ctx) must be true")
+	}
+	var nilCtx *cordis.Context
+	if cordis.Is(nilCtx) {
+		t.Fatal("Is((*Context)(nil)) must be false")
+	}
+	if cordis.Is("not a context") {
+		t.Fatal("Is(non-context) must be false")
+	}
+
+	// 数组形式：两个必选依赖，等价于 map[string]any{"a": nil, "b": nil}。
+	var seen []string
+	p := &cordis.Plugin{
+		Name:   "consumer",
+		Inject: cordis.InjectList("a", "b"),
+		Apply: func(ctx *cordis.Context, _ any) error {
+			if _, ok := ctx.Get("a"); !ok {
+				return errors.New("a missing")
+			}
+			if _, ok := ctx.Get("b"); !ok {
+				return errors.New("b missing")
+			}
+			seen = append(seen, "ready")
+			return nil
+		},
+	}
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Plugin(p, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if len(seen) != 0 {
+		t.Fatalf("must be pending while deps are missing: %v", seen)
+	}
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Provide("a", 1, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ctx.Provide("b", 2, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if fmt.Sprint(seen) != fmt.Sprint([]string{"ready"}) {
+		t.Fatalf("array-form inject: %v", seen)
+	}
+}
+
 // BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明
 // 该依赖的 Fiber 在场时，单次 provide/dispose 的耗时。
 // 引入倒排索引前该路径逐 fiber 全量扫描（O(全部 Fiber)）。

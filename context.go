@@ -35,6 +35,14 @@ func newRootContext(app *App) *Context {
 	return root
 }
 
+// Is 判断 value 是否为本运行时的上下文（对应官方的 Context.is()）。
+// 官方实现靠 symbol 标记判断（能识别派生副本与 Proxy），Go 的类型系统
+// 下只需一次类型断言即可达到同等效果。
+func Is(value any) bool {
+	c, ok := value.(*Context)
+	return ok && c != nil
+}
+
 // App 返回所属应用。
 func (c *Context) App() *App { return c.app }
 

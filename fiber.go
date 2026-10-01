@@ -141,6 +141,30 @@ func (f *Fiber) Config() any { return f.config }
 // UID 返回实例编号（已注销时为 0）。
 func (f *Fiber) UID() int { return f.uid }
 
+// Effects 返回当前仍生效的效果标签，按**注册序**（撤销时按此序的
+// 逆序执行）。用于自省与排障：例如断言"注销后不该残留效果"。
+//
+// 与官方 getEffects() 的差别：官方返回带 children 的效果树，因为它
+// 的生成器效果会为每个 yield 建立子效果对象；Go 的增量效果只登记
+// 一批普通撤销动作，没有可挂靠的父节点，这里给出平铺的标签列表。
+func (f *Fiber) Effects() []string {
+	return f.disposables.labelList()
+}
+
+// Restart 走一遍完整的卸载-重载循环：不换配置、不清错误
+// （对应官方 fiber.restart()）。配置热更新用 Update，它在此基础上
+// 先替换配置并清除错误状态。
+//
+// 失败的 Fiber 目标视图被冻结（P1 已钉住该语义），因此 Restart 对
+// 处于 failed 的实例没有任何作用——只有 Update 能让它恢复。
+func (f *Fiber) Restart() error {
+	if err := f.assertActive(); err != nil {
+		return err
+	}
+	f.restart()
+	return nil
+}
+
 // Dispose 将本实例从父上下文注销：先冻结 epoch 目标，
 // 待效果完全回收后终结生命周期。
 func (f *Fiber) Dispose() {
@@ -506,7 +530,7 @@ func (f *Fiber) effectStep(label string, execute func() (disposeStep, error)) (D
 			}
 			step.wait(then)
 		},
-	})
+	}, label)
 	return func() {
 		if done {
 			return

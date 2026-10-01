@@ -17,7 +17,7 @@ func TestDisposableCompactionPreservesOrder(t *testing.T) {
 	removes := make([]func(), 0, 16)
 	for i := 0; i < 16; i++ {
 		i := i
-		removes = append(removes, l.push(disposeStep{run: func() { disposed = append(disposed, i) }}))
+		removes = append(removes, l.push(disposeStep{run: func() { disposed = append(disposed, i) }}, fmt.Sprintf("step-%d", i)))
 	}
 	for i := 0; i < 9; i++ {
 		removes[i]()
@@ -47,14 +47,14 @@ func BenchmarkDisposableSteadyChurn(b *testing.B) {
 			l := newDisposableList()
 			removes := make([]func(), live)
 			for i := range removes {
-				removes[i] = l.push(disposeStep{run: func() {}})
+				removes[i] = l.push(disposeStep{run: func() {}}, "step")
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				slot := i % live
 				removes[slot]()
-				removes[slot] = l.push(disposeStep{run: func() {}})
+				removes[slot] = l.push(disposeStep{run: func() {}}, "step")
 			}
 		})
 	}
@@ -74,7 +74,7 @@ func BenchmarkDisposableCompaction(b *testing.B) {
 				l := newDisposableList()
 				removes := make([]func(), 0, 2*live)
 				for j := 0; j < 2*live; j++ {
-					removes = append(removes, l.push(disposeStep{run: func() {}}))
+					removes = append(removes, l.push(disposeStep{run: func() {}}, "step"))
 				}
 				// 删除 live 条：order 保持 2×live，存活降至 live，
 				// 阈值 order > 2×存活数 恰未成立（相等）。
@@ -108,12 +108,12 @@ func BenchmarkDisposableClear(b *testing.B) {
 				l := newDisposableList()
 				removes := make([]func(), live)
 				for j := range removes {
-					removes[j] = l.push(disposeStep{run: func() {}})
+					removes[j] = l.push(disposeStep{run: func() {}}, "step")
 				}
 				for j := 0; j < churn*live; j++ {
 					slot := j % live
 					removes[slot]()
-					removes[slot] = l.push(disposeStep{run: func() {}})
+					removes[slot] = l.push(disposeStep{run: func() {}}, "step")
 				}
 				b.StartTimer()
 				if n := len(l.clear()); n != live {

@@ -281,3 +281,133 @@ func mustOn(t *testing.T, ctx *cordis.Context, name string, l cordis.Listener) {
 		t.Fatal(err)
 	}
 }
+
+// TestLoaderNestedRealms 嵌套域：分组入口带 isolate 时，组内子入口
+// 默认继承该域；子入口自己声明的域（共享标签或私有域）覆盖继承值。
+// （对应官方 isolate.spec 的 realm reference / nested realms。）
+func TestLoaderNestedRealms(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var seen []any
+	h.plugins["bar"] = &cordis.Plugin{
+		Name: "bar",
+		Apply: func(ctx *cordis.Context, config any) error {
+			_, err := ctx.Provide("bar", config, nil)
+			return err
+		},
+	}
+	h.plugins["foo"] = &cordis.Plugin{
+		Name:   "foo",
+		Inject: map[string]any{"bar": nil},
+		Apply: func(ctx *cordis.Context, _ any) error {
+			v, _ := ctx.Get("bar")
+			seen = append(seen, v)
+			return nil
+		},
+	}
+
+	alpha := map[string]any{"bar": "alpha"}
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "pa", Name: "bar", Config: "A", Isolate: alpha},
+		{ID: "pb", Name: "bar", Config: "B", Isolate: map[string]any{"bar": "beta"}},
+		{ID: "g", Name: "group", Group: true, Isolate: alpha, Config: []cordis.EntryOptions{
+			{ID: "inherit", Name: "foo"}, // 继承分组域 alpha
+			{ID: "shared", Name: "foo", Isolate: map[string]any{"bar": "beta"}},
+			{ID: "private", Name: "foo", Isolate: map[string]any{"bar": true}},
+		}},
+	})
+
+	// 继承 alpha → A；共享标签 beta → B；私有域无人提供 → pending。
+	if fmt.Sprint(seen) != fmt.Sprint([]any{"A", "B"}) {
+		t.Fatalf("nested realms: %v", seen)
+	}
+	priv, err := h.loader.Tree().Resolve("g:private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if priv.Fiber().State() != cordis.StatePending {
+		t.Fatalf("private realm inside a group: %v", priv.Fiber().State())
+	}
+}
+
+// TestLoaderChangeProviderOrInjector 官方 isolate.spec 的两个特例：
+// 换**提供者**所在域、换**依赖者**所在域，都会让依赖者重建并按新域
+// 重新解析（旧实例先完全下线）。
+func TestLoaderChangeProviderOrInjector(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var (
+		applied int
+		removed int
+		seen    []any
+	)
+	h.plugins["bar"] = &cordis.Plugin{
+		Name: "bar",
+		Apply: func(ctx *cordis.Context, config any) error {
+			_, err := ctx.Provide("bar", config, nil)
+			return err
+		},
+	}
+	h.plugins["foo"] = &cordis.Plugin{
+		Name:   "foo",
+		Inject: map[string]any{"bar": nil},
+		Apply: func(ctx *cordis.Context, _ any) error {
+			applied++
+			v, _ := ctx.Get("bar")
+			seen = append(seen, v)
+			_, err := ctx.Effect("foo", func() (cordis.Dispose, error) {
+				return func() { removed++ }, nil
+			})
+			return err
+		},
+	}
+
+	// 提供者先占 alpha 域，依赖者继承分组的 alpha 域。
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "pa", Name: "bar", Config: "A", Isolate: map[string]any{"bar": "alpha"}},
+		{ID: "pb", Name: "bar", Config: "B", Isolate: map[string]any{"bar": "beta"}},
+		{ID: "g", Name: "group", Group: true, Isolate: map[string]any{"bar": "alpha"}, Config: []cordis.EntryOptions{
+			{ID: "c", Name: "foo"},
+		}},
+	})
+	if fmt.Sprint(seen) != fmt.Sprint([]any{"A"}) || applied != 1 {
+		t.Fatalf("baseline: seen=%v applied=%d", seen, applied)
+	}
+
+	// 换提供者所在域（依赖者继承分组域，故随分组一起重建）：
+	// 旧实例先下线，再按 beta 重新解析。
+	seen = nil
+	if err := h.loader.Update("g", cordis.EntryOptions{
+		Name:    "group",
+		Group:   true,
+		Isolate: map[string]any{"bar": "beta"},
+		Config: []cordis.EntryOptions{
+			{ID: "c", Name: "foo"},
+		},
+	}, "", -1); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(seen) != fmt.Sprint([]any{"B"}) {
+		t.Fatalf("change provider realm: seen=%v, want [B]", seen)
+	}
+	if applied != 2 || removed != 1 {
+		t.Fatalf("change provider realm: applied=%d removed=%d, want 2/1", applied, removed)
+	}
+
+	// 换依赖者自己的域：改用共享标签 alpha（提供者 pa 在该域）。
+	seen = nil
+	if err := h.loader.Update("g:c", cordis.EntryOptions{
+		Name:    "foo",
+		Isolate: map[string]any{"bar": "alpha"},
+	}, "", -1); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(seen) != fmt.Sprint([]any{"A"}) {
+		t.Fatalf("change injector realm: seen=%v, want [A]", seen)
+	}
+	if applied != 3 || removed != 2 {
+		t.Fatalf("change injector realm: applied=%d removed=%d, want 3/2", applied, removed)
+	}
+}

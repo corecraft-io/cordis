@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -284,6 +286,65 @@ func (e *Entry) init() {
 	}, e)
 }
 
+// interpolateString 展开模板中的 ${env:NAME}（环境变量，未定义为空串）。
+// 不含 "${" 的字符串直接返回原值，避免为整棵配置树分配副本。
+func interpolateString(s string) string {
+	if !strings.Contains(s, "${") {
+		return s
+	}
+	return envPattern.ReplaceAllStringFunc(s, func(match string) string {
+		name := match[6 : len(match)-1] // "${env:" + name + "}"
+		return os.Getenv(name)
+	})
+}
+
+// interpolate 递归展开配置里的环境变量模板。
+//
+// 官方实现的 interpolate/evaluate 支持更丰富的表达式（跨入口引用、
+// 模板拼接、非字符串原值等）；Go 侧只覆盖最常用的一类——其余交给
+// 嵌入方在自己的解析层完成，本层不发明私有语法。
+func interpolate(config any) any {
+	switch v := config.(type) {
+	case string:
+		if got := interpolateString(v); got != v {
+			return got
+		}
+		return v
+	case map[string]any:
+		changed := false
+		out := make(map[string]any, len(v))
+		for k, item := range v {
+			next := interpolate(item)
+			changed = changed || !reflect.DeepEqual(next, item)
+			out[k] = next
+		}
+		if !changed {
+			return v
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = interpolate(item)
+		}
+		return out
+	}
+	return config
+}
+
+// Evaluate 求一个配置表达式的值（目前支持 ${env:NAME}）。
+// 对应官方 Entry.evaluate。
+func (e *Entry) Evaluate(expr string) string { return interpolateString(expr) }
+
+// resolveConfig 入口交给插件的配置：分组配置是子入口列表（不插值），
+// 其余先展开模板——与官方 Entry._resolveConfig 同样的分派。
+func (e *Entry) resolveConfig(p *Plugin) any {
+	if p == groupPlugin {
+		return e.options.Config
+	}
+	return interpolate(e.options.Config)
+}
+
 // load 在上文构建好的上下文里实例化插件（init 的第二段）。
 func (e *Entry) load() {
 	p := groupPlugin
@@ -296,7 +357,7 @@ func (e *Entry) load() {
 		}
 	}
 	e.loader.showLog(e, "apply")
-	f, err := e.ctx.Registry().PluginInject(e.ctx, p, e.options.Config, refineInject(p.Inject, e.options.Inject))
+	f, err := e.ctx.Registry().PluginInject(e.ctx, p, e.resolveConfig(p), refineInject(p.Inject, e.options.Inject))
 	if err != nil {
 		if f == nil {
 			// 结构性失败：Fiber 从未注册，入口留空。
@@ -315,6 +376,10 @@ func (e *Entry) load() {
 	f.OnUpdate(func(config any, noSave bool) bool {
 		if noSave {
 			return true
+		}
+		// 运行期配置先过 Simplify 再落回入口配置（可持久化形态）。
+		if simplify := f.runtime.plugin.Simplify; simplify != nil {
+			config = simplify(config)
 		}
 		legacy := e.options
 		e.options.Config = config
@@ -900,3 +965,6 @@ func (l *Loader) onPluginEvent(f *Fiber) {
 	e.options.Disabled = true
 	l.tree.commit(EntryChange{ID: legacy.ID, Group: e.parent, Options: &e.options, Legacy: &legacy})
 }
+
+// envPattern 匹配 ${env:NAME}。
+var envPattern = regexp.MustCompile(`\$\{env:([^{}]*)\}`)

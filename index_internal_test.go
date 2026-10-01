@@ -409,3 +409,86 @@ func TestReflectCandidatesDeduplicateAcrossKeys(t *testing.T) {
 	}
 	app.Close()
 }
+
+// TestServiceInjectLeavesNoStaleState 官方 reflect.spec 的
+// "service inject leak"：依赖者在服务反复上下线的过程中，既不能留下
+// 陈旧的实现引用，也不能在倒排索引里留下永远清不掉的登记。
+//
+// 判定方式：把服务下线到"依赖者全部 pending"之后，
+//   - 依赖者的 deps 表必须为空（不再指着已销毁的实现）；
+//   - 倒排索引的规模只与"仍声明该依赖的 fiber 数"相关，不随
+//     上下线轮次增长。
+func TestServiceInjectLeavesNoStaleState(t *testing.T) {
+	app := New()
+	defer app.Close()
+
+	consumer := &Plugin{
+		Name:   "consumer",
+		Inject: map[string]any{"svc": nil},
+		Apply:  func(*Context, any) error { return nil },
+	}
+	var fibers []*Fiber
+	app.DoSync(func(ctx *Context) {
+		for i := 0; i < 3; i++ {
+			f, err := ctx.Plugin(consumer, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fibers = append(fibers, f)
+		}
+	})
+	app.Wait()
+
+	var provide Dispose
+	rounds := 5
+	for r := 0; r < rounds; r++ {
+		app.DoSync(func(ctx *Context) {
+			d, err := ctx.Provide("svc", r, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provide = d
+		})
+		app.Wait()
+		for _, f := range fibers {
+			if f.State() != StateActive {
+				t.Fatalf("round %d: consumer %d is %v, want active", r, f.UID(), f.State())
+			}
+			if len(f.deps) != 1 {
+				t.Fatalf("round %d: deps=%d, want 1", r, len(f.deps))
+			}
+		}
+		indexLen := len(app.root.reflect.index[isolateKey{name: "svc"}])
+		if indexLen != len(fibers) {
+			t.Fatalf("round %d: index bucket=%d, want %d (registrations, not cycles)",
+				r, indexLen, len(fibers))
+		}
+
+		app.DoSync(func(*Context) { provide() })
+		app.Wait()
+		for _, f := range fibers {
+			if f.State() != StatePending {
+				t.Fatalf("round %d after dispose: consumer is %v, want pending", r, f.State())
+			}
+			if len(f.deps) != 0 {
+				t.Fatalf("round %d: stale dep kept: %v", r, f.deps)
+			}
+		}
+	}
+
+	// 索引规模不随轮次增长：仍是"声明了该依赖的 fiber 数"。
+	if got := len(app.root.reflect.index[isolateKey{name: "svc"}]); got != len(fibers) {
+		t.Fatalf("index after %d cycles: %d, want %d", rounds, got, len(fibers))
+	}
+
+	// 注销依赖者后索引应随之清空（不留空桶）。
+	app.DoSync(func(*Context) {
+		for _, f := range fibers {
+			f.Dispose()
+		}
+	})
+	app.Wait()
+	if _, present := app.root.reflect.index[isolateKey{name: "svc"}]; present {
+		t.Fatal("index bucket must be deleted with its last registrant")
+	}
+}

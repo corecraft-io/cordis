@@ -25,25 +25,33 @@ func (s disposeStep) invoke(then func()) {
 // 对应官方实现的 DisposableList：push 返回移除函数，
 // delete 可中途移除单个条目，clear 原子地取出全部并清空。
 type disposableList struct {
-	next  int
-	order []int
-	steps map[int]disposeStep
+	next   int
+	order  []int
+	steps  map[int]disposeStep
+	labels map[int]string // 与 steps 同生命周期，供效果自省
 }
 
 func newDisposableList() *disposableList {
-	return &disposableList{steps: make(map[int]disposeStep)}
+	return &disposableList{
+		steps:  make(map[int]disposeStep),
+		labels: make(map[int]string),
+	}
 }
 
-func (l *disposableList) push(step disposeStep) func() {
+// push 登记一步撤销。label 同时记入标签表，用于 Effects() 自省；
+// 压缩只重建 order（int 切片），标签表不动，因此二者始终对齐。
+func (l *disposableList) push(step disposeStep, label string) func() {
 	id := l.next
 	l.next++
 	l.order = append(l.order, id)
 	l.steps[id] = step
+	l.labels[id] = label
 	return func() { l.delete(id) }
 }
 
 func (l *disposableList) delete(id int) {
 	delete(l.steps, id)
+	delete(l.labels, id)
 	// 墓碑过多时压缩 order，摊还 O(1)。
 	if len(l.order) > 8 && len(l.order) > 2*len(l.steps) {
 		l.order = l.order[:0]
@@ -66,7 +74,19 @@ func (l *disposableList) clear() []disposeStep {
 	}
 	l.order = l.order[:0]
 	clear(l.steps)
+	clear(l.labels)
 	return steps
 }
 
 func (l *disposableList) len() int { return len(l.steps) }
+
+// labels 按注册序返回仍存活的效果标签（已删除的条目不出现）。
+func (l *disposableList) labelList() []string {
+	out := make([]string, 0, len(l.steps))
+	for _, id := range l.order {
+		if label, ok := l.labels[id]; ok {
+			out = append(out, label)
+		}
+	}
+	return out
+}

@@ -210,6 +210,21 @@ func (r *Registry) PluginInject(ctx *Context, p *Plugin, config any, inject map[
 	return f, cfgErr
 }
 
+// InjectList 把服务名列表转换为必选依赖声明（对应官方 inject 的
+// **数组形式** `inject: ['a', 'b']`）：值与官方一致，均为 nil，
+// 即"必选依赖、无附加拦截配置"。
+//
+// 官方的 Inject.resolve 还会沿原型链合并类继承来的 inject 表；
+// Go 没有原型链，多形态依赖用 map 直接表达即可（Plugin.Inject /
+// EntryOptions.Inject 都是 map[string]any）。
+func InjectList(names ...string) map[string]any {
+	out := make(map[string]any, len(names))
+	for _, name := range names {
+		out[name] = nil
+	}
+	return out
+}
+
 // Inject 声明动态依赖：deps 满足时执行 apply 并追踪其全部效果，
 // 任一依赖失满足时效果被逆序回收。等价于实例化一个匿名插件。
 func (r *Registry) Inject(ctx *Context, deps map[string]any, apply func(ctx *Context) error) (*Fiber, error) {

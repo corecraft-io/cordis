@@ -93,8 +93,13 @@ var (
 // （nil 表示必选依赖、无附加配置）。声明后本插件的激活与否交由
 // 运行时根据依赖满足状态自动驱动。
 type Plugin struct {
-	Name     string
-	Inject   map[string]any
+	Name   string
+	Inject map[string]any
+	// Validate 校验（并可规范化）配置，返回交给组件的配置。
 	Validate func(config any) (any, error)
+	// Simplify 把运行期配置还原为**可持久化**的形态。loader 回写入口
+	// 配置时先过它（对应官方 Config.simplify）：例如把已展开的结构体
+	// 折叠回原始字段，避免持久化出不认识的中间形态。
+	Simplify func(config any) any
 	Apply    func(ctx *Context, config any) error
 }
