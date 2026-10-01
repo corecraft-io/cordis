@@ -5,7 +5,7 @@
 [English](README.md) · **中文**
 
 > 论文《[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)》所提出的**时空可组合组件模型**的纯 Go 实现。
-> 零第三方依赖 · 单 goroutine 免锁运行时 · 57 项测试全绿（含 `-race`）· Apache-2.0
+> 零第三方依赖 · 单 goroutine 免锁运行时 · 65 项测试全绿（含 `-race`）· Apache-2.0
 
 ---
 
@@ -36,6 +36,20 @@
 | 声明式配置 | loader | `Loader` | `Entry` / `EntryGroup` / `EntryTree` + 协调算法 |
 
 上表把论文与官方 TypeScript 实现的每个概念逐一对应到本实现的类型上，便于对照阅读。右列记录 Go 类型实际持有的数据，备注列标出移植时需要留意的语义。
+
+### 与官方实现的有意差异
+
+以下是**有意不对齐**的地方，附理由与把它钉住的测试：
+
+| 方面 | 官方 TS 实现 | 本实现 | 理由 |
+| --- | --- | --- | --- |
+| `fiber.update` 的错误上报 | `async`：重载失败 reject 给调用方 | `Update` 立即返回；重载失败经 `Err()` / `State() == failed` 暴露 | 调用方通常已经在唯一的调度 goroutine 内部，无法阻塞等待自己的重载（`TestUpdateReportsReloadFailureAsynchronously` 钉住该分歧） |
+| 依赖变更通知 | 遍历全部 runtime × fiber 全量扫描 | 以隔离域键分桶的倒排索引（`Reflect.index`），`filter` 参数已**有意删除** | 全量扫描在 insula 的 10000 租户下实测退化为 O(N²)；确需自定义路由就另建一张索引，而不是加回 filter |
+| 事件名 | 字符串或 symbol | 仅字符串 | Go map 没有原型链，官方测试专门防的 `__proto__` / `toString` 污染在 Go 里根本不会发生 |
+| 服务访问 | `Context` 是 Proxy；`Service` 基类、`accessor` / `mixin`、可调用服务、`shadow` / traceable 接收者 | 普通结构体与方法；`Get` / `Provide` / `Intercept` 覆盖同等场景 | Proxy 层是为了让 `ctx.foo` 在 JS 里成为属性读取；Go 显式解析服务。因此官方的 `associate` / `shadow` / `invoke` 三组测试属 **N/A**，不是缺漏 |
+| 效果 | 可为异步（`Promise`、async generator），撤销可 await | 同步 `Dispose`；异步清理用两阶段 `disposeStep{run, wait}` 表达，由 `Wait()` 汇报收敛 | 同上：单调度 goroutine，无 Promise 机制 |
+| 配置校验 | Standard Schema（`~standard.validate`） | `Plugin.Validate func(any) (any, error)` | Go 没有 Standard Schema；错误契约（结构性失败 vs 配置失败）保持一致 |
+| `@Inject` 装饰器 | 类方法装饰器 | N/A | Go 无装饰器；`Plugin.Inject` 与 `ctx.Inject` 表达同一件事 |
 
 ---
 
@@ -70,19 +84,20 @@ flowchart TD
 | --- | --- | --- |
 | `cordis.go` | 97 | 包文档、`FiberState`、错误值集合、`Plugin` 定义 |
 | `app.go` | 225 | `App` 宿主、单 goroutine `scheduler`、`Wait` / `Close` |
-| `context.go` | 210 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
-| `fiber.go` | 628 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、局部更新钩子、配置热更新 |
+| `context.go` | 257 | 统一上下文、`Isolate` / `Intercept` 派生、`Get` / `Provide` 门面 |
+| `fiber.go` | 643 | Fiber 状态机、`epoch` 惯性追逐、效果与 LIFO 撤销、局部更新钩子、配置热更新 |
 | `reflect.go` | 294 | 协效应存储、域键解析、依赖倒排索引与变更通知（dependant-first） |
 | `registry.go` | 213 | `Plugin → Runtime` 映射、`Plugin` / `PluginInject` / `Inject` 实例化入口 |
-| `events.go` | 337 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）、监听器路由与 `Logger` |
+| `events.go` | 339 | 事件总线（`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`）、监听器路由与 `Logger` |
 | `disposable.go` | 72 | 两阶段撤销步骤 `disposeStep` 与保序 `disposableList` |
 | `loader.go` | 785 | 声明式配置层：`EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | 端到端示例：数据库 + 缓存 + Web，覆盖热重载 / 降级 / 隔离域 |
-| `cordis_test.go` | 1576 | 核心运行时测试（33 项 + 1 基准） |
-| `loader_test.go` | 707 | 声明式配置层测试（15 项 + 1 基准） |
+| `cordis_test.go` | 1832 | 核心运行时测试（37 项 + 1 基准） |
+| `loader_test.go` | 887 | 声明式配置层测试（17 项 + 1 基准） |
 | `index_internal_test.go` | 411 | 依赖倒排索引的生命周期不变量（白盒） |
 | `disposable_internal_test.go` | 125 | 墓碑压缩的不变量与基准（1 项 + 3 基准，白盒） |
 | `registry_internal_test.go` | 145 | `Runtime` 增删一致性（白盒） |
+| `events_internal_test.go` | 127 | 事件桶生命周期与监听器泄漏快照（2 项，白盒） |
 
 ---
 
@@ -92,7 +107,7 @@ flowchart TD
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 57 项测试
+go test ./...          # 65 项测试
 go test -race ./...    # 竞态检测
 go vet ./...
 go run ./example       # 端到端示例，打印各入口状态
@@ -194,6 +209,8 @@ ctx.Intercept("database", myConfig)   // 供提供者读取的拦截配置
 ```
 
 在 loader 层用 `EntryOptions.Isolate` 声明：`true` 表示入口私有域（键 `#入口ID`），字符串表示共享域（键 `@标签`）。
+
+拦截配置由 `ctx.InterceptOf(name)` 解析：**沿上下文链自远及近逐层合并**（对应官方 `Service[resolveConfig]`）。两层同为 `map[string]any` 时按键浅合并、近层覆盖同名键；任一层不是 map 就整体替换（非 map 没有"键"可谈）。合并结果总是新 map，提供者改它不会污染声明，也不会串到下一次读取。
 
 ### 5.5 事件
 
@@ -370,11 +387,11 @@ stateDiagram-v2
 
 ## 10. 测试覆盖
 
-`go test ./...` → **57 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
+`go test ./...` → **65 项全部通过**；`go test -race ./...` 无竞态报告；另有 5 个基准（`-bench .`）。
 
 CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低版本）与 **stable** 两档上执行：`gofmt -l` 零差异、`go vet`、`go build`、`go test -race`、基准运行、`go run ./example` 冒烟。
 
-**核心运行时（`cordis_test.go`，33 项）**
+**核心运行时（`cordis_test.go`，37 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -407,8 +424,12 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestUpdateHookNoSaveAndVeto` | `noSave` 抵达钩子；返回 `false` 即否决配置替换与重启 |
 | `TestUpdateHookDuplicateNextIsReported` | 钩子误用 `next` 时 `Update` 返回错误而非击穿调度器 |
 | `TestInternalListenerTakesOver` | `internal/listener` 可接管注册，并自行负责注销 |
+| `TestInterceptChainMerges` | 拦截配置沿上下文链合并（近层按键覆盖）；结果不与任何声明共享 |
+| `TestUpdateReportsReloadFailureAsynchronously` | 钉住有意差异：重载失败**不**同步回报，校验失败同步回报 |
+| `TestEffectIterPanicReclaimsYielded` | `iter` 中途 panic 时已 yield 的部分按 LIFO 回收，且 panic 继续上抛 |
+| `TestFailedFiberDoesNotReenterOnDependencyRefresh` | 失败的 fiber 在依赖反复上下线中保持冻结，只有 `Update` 能恢复 |
 
-**声明式配置层（`loader_test.go`，15 项）**
+**声明式配置层（`loader_test.go`，17 项）**
 
 | 测试 | 覆盖点 |
 | --- | --- |
@@ -420,6 +441,8 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 | `TestLoaderConfigErrorRecovery` | 校验失败后原地恢复 |
 | `TestLoaderCommitHook` / `TestLoaderSelfDispose` | 提交钩子、插件自行卸载 |
 | `TestLoaderLargeLoad` | 1100 入口单次 Load 不死锁 |
+| `TestLoaderIsolateMigration` | 两侧加减 `isolate`（relevant / irrelevant 服务名、共享域引用）与「注销重建」等效 |
+| `TestLoaderIsolateTransfer` | 跨组移动不改变域身份 |
 
 **内部不变量（白盒）**
 
@@ -428,6 +451,8 @@ CI（`.github/workflows/ci.yml`）在 **Go 1.22.x**（`go.mod` 声明的最低�
 `TestDisposableCompactionPreservesOrder`（`disposable_internal_test.go`）—— 墓碑压缩确实触发（`order > 8` 且 `order > 2×存活数`），且按 `id` 排序重建后 LIFO 序不破。
 
 `TestRuntimeRemoveConsistency` / `TestRuntimeRemoveThroughDispose`（`registry_internal_test.go`）—— 乱序注销下 `Runtime.fibers` / `Runtime.index` 始终自洽（ADR-0007 的 O(1) 交换删除路径），`Close` 级联后两者同时清空。
+
+`TestEventBucketLifecycle` / `TestEventListenerNoLeakAcrossPluginTeardown`（`events_internal_test.go`）—— 空桶被**删除**而不是留下 `len == 0` 的键；注销插件实例后桶快照精确回到基线（对应官方 `getHookSnapshot` 的对比断言）。
 
 **基准**
 

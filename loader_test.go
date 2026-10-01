@@ -358,6 +358,186 @@ func TestLoaderEntryIsolate(t *testing.T) {
 	}
 }
 
+// TestLoaderIsolateMigration 域迁移的等价性：**加减 isolate 必须与
+// 「注销重建」等效**，无论改动落在提供者一侧还是依赖者一侧。
+// 覆盖官方 loader 测试的 relevant / irrelevant 两个方向——
+// relevant（改的正是那对服务交换依赖）会断开或恢复连接，
+// irrelevant（改的是别的服务名）只触发重载、不影响连接。
+func TestLoaderIsolateMigration(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var seen []any
+	h.plugins["provider"] = &cordis.Plugin{
+		Name: "provider",
+		Apply: func(ctx *cordis.Context, config any) error {
+			_, err := ctx.Provide("svc", config, nil)
+			return err
+		},
+	}
+	h.plugins["consumer"] = &cordis.Plugin{
+		Name:   "consumer",
+		Inject: map[string]any{"svc": nil},
+		Apply: func(ctx *cordis.Context, _ any) error {
+			v, ok := ctx.Get("svc")
+			if !ok {
+				return fmt.Errorf("consumer: svc unavailable")
+			}
+			seen = append(seen, v)
+			return nil
+		},
+	}
+
+	stateOf := func(id string) cordis.FiberState {
+		t.Helper()
+		e, err := h.loader.Tree().Resolve(id)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", id, err)
+		}
+		if e.Fiber() == nil {
+			return cordis.StateDisposed
+		}
+		return e.Fiber().State()
+	}
+	load := func(opts ...cordis.EntryOptions) {
+		t.Helper()
+		h.loader.Load(opts)
+	}
+
+	p := func(iso map[string]any) cordis.EntryOptions {
+		return cordis.EntryOptions{ID: "p", Name: "provider", Config: 1, Isolate: iso}
+	}
+	c := func(iso map[string]any) cordis.EntryOptions {
+		return cordis.EntryOptions{ID: "c", Name: "consumer", Isolate: iso}
+	}
+
+	// 0) 默认域：直接连通。
+	load(p(nil), c(nil))
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("baseline: consumer %v", stateOf("c"))
+	}
+
+	// 1) 依赖者侧加 eg isolate（relevant）→ 域不同，断连。
+	load(p(nil), c(map[string]any{"svc": "one"}))
+	if stateOf("c") != cordis.StatePending {
+		t.Fatalf("injector isolate must disconnect: %v", stateOf("c"))
+	}
+
+	// 2) 提供者跟进同一域 → 恢复。
+	load(p(map[string]any{"svc": "one"}), c(map[string]any{"svc": "one"}))
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("matching realms must reconnect: %v", stateOf("c"))
+	}
+	if fmt.Sprint(seen) != fmt.Sprint([]any{1, 1}) {
+		t.Fatalf("consumer reload sequence: %v", seen)
+	}
+
+	// 3) 依赖者撤掉 isolate → 回到默认域，再次断连。
+	load(p(map[string]any{"svc": "one"}), c(nil))
+	if stateOf("c") != cordis.StatePending {
+		t.Fatalf("removing injector isolate must disconnect: %v", stateOf("c"))
+	}
+
+	// 4) 提供者也撤掉 → 恢复。
+	load(p(nil), c(nil))
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("default realm must reconnect: %v", stateOf("c"))
+	}
+
+	// 5) 提供者侧加 isolate（relevant）→ 断连。
+	load(p(map[string]any{"svc": "one"}), c(nil))
+	if stateOf("c") != cordis.StatePending {
+		t.Fatalf("provider isolate must disconnect: %v", stateOf("c"))
+	}
+
+	// 6) irrelevant：改的是双方都不依赖的服务名 → 连接不受影响。
+	//（双方各自仍会因自身声明变化而重载，这里只断言连接性。）
+	load(
+		cordis.EntryOptions{ID: "p", Name: "provider", Config: 1, Isolate: map[string]any{"other": "x"}},
+		c(map[string]any{"other": "one"}),
+	)
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("irrelevant isolate broke the link: %v", stateOf("c"))
+	}
+	load(
+		cordis.EntryOptions{ID: "p", Name: "provider", Config: 1, Isolate: map[string]any{"other": "y"}},
+		c(map[string]any{"other": "one"}),
+	)
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("irrelevant provider isolate broke the link: %v", stateOf("c"))
+	}
+
+	// 7) 共享域引用：两个依赖者共用一个标签，与提供者互通；
+	//    移除其中一个不影响另一个（域仍被引用）。
+	load(
+		p(map[string]any{"svc": "shared"}),
+		cordis.EntryOptions{ID: "c", Name: "consumer", Isolate: map[string]any{"svc": "shared"}},
+		cordis.EntryOptions{ID: "c2", Name: "consumer", Isolate: map[string]any{"svc": "shared"}},
+	)
+	if stateOf("c") != cordis.StateActive || stateOf("c2") != cordis.StateActive {
+		t.Fatalf("shared realm must serve both consumers: %v %v", stateOf("c"), stateOf("c2"))
+	}
+	load(
+		p(map[string]any{"svc": "shared"}),
+		cordis.EntryOptions{ID: "c", Name: "consumer", Isolate: map[string]any{"svc": "shared"}},
+	)
+	if stateOf("c") != cordis.StateActive {
+		t.Fatalf("surviving consumer lost the realm: %v", stateOf("c"))
+	}
+}
+
+// TestLoaderIsolateTransfer 跨组移动不改变域身份：入口搬到别的分组后，
+// 与同标签的提供者仍互为可见（域键由标签决定，与所在分组无关）。
+func TestLoaderIsolateTransfer(t *testing.T) {
+	h := newLoaderHarness(t)
+	defer h.close()
+
+	var applied []any
+	h.plugins["provider"] = &cordis.Plugin{
+		Name: "provider",
+		Apply: func(ctx *cordis.Context, config any) error {
+			_, err := ctx.Provide("svc", config, nil)
+			return err
+		},
+	}
+	h.plugins["consumer"] = &cordis.Plugin{
+		Name:   "consumer",
+		Inject: map[string]any{"svc": nil},
+		Apply: func(ctx *cordis.Context, _ any) error {
+			v, _ := ctx.Get("svc")
+			applied = append(applied, v)
+			return nil
+		},
+	}
+
+	realm := map[string]any{"svc": "one"}
+	h.loader.Load([]cordis.EntryOptions{
+		{ID: "p", Name: "provider", Config: 7, Isolate: realm},
+		{ID: "g", Name: "group", Group: true, Config: []cordis.EntryOptions{
+			{ID: "c", Name: "consumer", Isolate: realm},
+		}},
+	})
+	e, _ := h.loader.Tree().Resolve("g:c")
+	if e.Fiber() == nil || e.Fiber().State() != cordis.StateActive {
+		t.Fatalf("grouped consumer: %v", e.Fiber())
+	}
+	if fmt.Sprint(applied) != fmt.Sprint([]any{7}) {
+		t.Fatalf("grouped consumer saw %v", applied)
+	}
+
+	// 移出分组 → 仍在同一 (svc, one) 域，依赖不破。
+	if err := h.loader.Update("g:c", cordis.EntryOptions{Name: "consumer", Isolate: realm}, "", -1); err != nil {
+		t.Fatal(err)
+	}
+	e, _ = h.loader.Tree().Resolve("c")
+	if e.Fiber() == nil || e.Fiber().State() != cordis.StateActive {
+		t.Fatalf("transferred consumer lost its realm: %v", e.Fiber())
+	}
+	if len(applied) < 2 || applied[len(applied)-1] != 7 {
+		t.Fatalf("transferred consumer saw %v", applied)
+	}
+}
+
 func TestLoaderEntryInject(t *testing.T) {
 	h := newLoaderHarness(t)
 	defer h.close()

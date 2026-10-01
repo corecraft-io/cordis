@@ -98,14 +98,61 @@ func (c *Context) isolateKey(name string) isolateKey {
 	return isolateKey{name: name}
 }
 
-// InterceptOf 返回 name 的拦截配置（沿链最近定义优先）。
+// InterceptOf 返回 name 的拦截配置：沿链**自远及近逐层合并**
+// （对应官方实现的 Service[resolveConfig]：逐层 Object.assign）。
+//
+// 合并规则：相邻两层同为 map[string]any 时按键浅合并（近层覆盖同名键），
+// 其余情况近层整体替换——非 map 的配置没有"键"可谈，按整体替换是
+// 唯一可定义的语义。合并结果总是新建的 map，调用方拿到的配置
+// 与任何一层的原值都不共享（改它不会污染上层声明）。
 func (c *Context) InterceptOf(name string) (any, bool) {
+	layers := make([]any, 0, 2)
 	for ctx := c; ctx != nil; ctx = ctx.parent {
 		if cfg, ok := ctx.intercepts[name]; ok {
-			return cfg, true
+			layers = append(layers, cfg)
 		}
 	}
-	return nil, false
+	if len(layers) == 0 {
+		return nil, false
+	}
+	merged := copyIntercept(layers[len(layers)-1]) // 最远的一层
+	for i := len(layers) - 2; i >= 0; i-- {
+		merged = mergeIntercept(merged, layers[i])
+	}
+	return merged, true
+}
+
+// copyIntercept 复制一层配置，使合并结果的任何一层都不与声明共享。
+func copyIntercept(cfg any) any {
+	m, ok := cfg.(map[string]any)
+	if !ok {
+		return cfg
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// mergeIntercept 把近层 near 合并到远层 far 之上。
+func mergeIntercept(far, near any) any {
+	farMap, ok := far.(map[string]any)
+	if !ok {
+		return near
+	}
+	nearMap, ok := near.(map[string]any)
+	if !ok {
+		return near
+	}
+	out := make(map[string]any, len(farMap)+len(nearMap))
+	for k, v := range farMap {
+		out[k] = v
+	}
+	for k, v := range nearMap {
+		out[k] = v
+	}
+	return out
 }
 
 // Get 解析服务 name：从当前 Fiber 沿父链向上查找最近的可访问实现。

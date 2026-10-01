@@ -3,6 +3,7 @@ package cordis_test
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1529,6 +1530,261 @@ func TestInternalListenerTakesOver(t *testing.T) {
 			t.Fatalf("custom dispose: %d", revoked)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 拦截配置沿链合并
+// ---------------------------------------------------------------------------
+
+// TestInterceptChainMerges 拦截配置沿上下文链**自远及近逐层合并**
+// （对齐官方 Service[resolveConfig] 的逐层 Object.assign），
+// 近层覆盖同名键，且不污染任何一层声明。
+func TestInterceptChainMerges(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	h.run(func(ctx *cordis.Context) {
+		outer := map[string]any{"host": "far", "port": 1, "keep": true}
+		inner := map[string]any{"port": 2}
+		mid := ctx.Intercept("db", outer)
+		near := mid.Intercept("db", inner)
+
+		got, ok := near.InterceptOf("db")
+		if !ok {
+			t.Fatal("intercept not found")
+		}
+		merged, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("merged intercept is %T, want map[string]any", got)
+		}
+		want := map[string]any{"host": "far", "port": 2, "keep": true}
+		if !reflect.DeepEqual(merged, want) {
+			t.Fatalf("merged intercept: %v, want %v", merged, want)
+		}
+
+		// 中间层与最远层各自保持原值（合并结果不与声明共享）。
+		if v, _ := mid.InterceptOf("db"); !reflect.DeepEqual(v, outer) {
+			t.Fatalf("far layer mutated: %v", v)
+		}
+		if v, _ := near.InterceptOf("other"); v != nil {
+			t.Fatalf("unexpected intercept: %v", v)
+		}
+		if _, ok := near.InterceptOf("other"); ok {
+			t.Fatal("missing intercept reported as found")
+		}
+
+		// 合并结果是新 map：改它不影响声明，也不会串到下一次读取。
+		merged["port"] = 99
+		again, _ := near.InterceptOf("db")
+		if again.(map[string]any)["port"] != 2 {
+			t.Fatalf("merge result leaked into the declaration: %v", again)
+		}
+
+		// 非 map 层无法定义按键合并：近层整体替换。
+		plain := ctx.Intercept("db", "dsn-string")
+		if v, _ := plain.InterceptOf("db"); v != "dsn-string" {
+			t.Fatalf("non-map layer should replace: %v", v)
+		}
+		back := plain.Intercept("db", map[string]any{"port": 3})
+		if v, _ := back.InterceptOf("db"); !reflect.DeepEqual(v, map[string]any{"port": 3}) {
+			t.Fatalf("map over non-map should replace: %v", v)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// 有意差异：Update 的错误语义
+// ---------------------------------------------------------------------------
+
+// TestUpdateReportsReloadFailureAsynchronously 钉住与官方实现的**有意差异**：
+// TS 的 update 是 async，重载失败会 reject 给调用方；Go 的 Update 立即返回
+// （重载在调度器上稍后发生），因此只回报即时错误（校验、钩子），重载失败
+// 经 Err() / State() 暴露。这条测试是分歧的守卫：行为若变成同步回报，
+// 这里会先变红，提醒同步更新 README 的差异表。
+func TestUpdateReportsReloadFailureAsynchronously(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	fail := false
+	p := &cordis.Plugin{
+		Name: "p",
+		Apply: func(*cordis.Context, any) error {
+			if fail {
+				return errors.New("boom")
+			}
+			return nil
+		},
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// 加载期失败：Update 的返回值不承载重载错误。
+	h.run(func(_ *cordis.Context) {
+		fail = true
+		if err := f.Update("b"); err != nil {
+			t.Fatalf("Update returned %v, want nil (reload errors are not synchronous)", err)
+		}
+	})
+	if f.State() != cordis.StateFailed {
+		t.Fatalf("state after failed reload: %v, want failed", f.State())
+	}
+	if f.Err() == nil {
+		t.Fatal("reload failure must be observable through Err()")
+	}
+
+	// 校验失败仍是即时错误（与钩子错误同属"调用前"可判定的一类）。
+	strict := &cordis.Plugin{
+		Name:     "strict",
+		Validate: func(any) (any, error) { return nil, errors.New("bad config") },
+		Apply:    func(*cordis.Context, any) error { return nil },
+	}
+	h.run(func(ctx *cordis.Context) {
+		sf, err := ctx.Plugin(strict, "x")
+		if err == nil {
+			t.Fatal("expected validation error")
+		}
+		if sf == nil {
+			t.Fatal("failed-config fiber must stay registered")
+		}
+		if err := sf.Update("y"); err == nil {
+			t.Fatal("Update must report validation errors immediately")
+		}
+	})
+}
+
+// TestEffectIterPanicReclaimsYielded iter 中途 panic 时，已 yield 登记的
+// 撤销动作必须立即逆序回收（否则那些副作用再无认领者），panic 继续上抛。
+func TestEffectIterPanicReclaimsYielded(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	var seq []string
+	p := &cordis.Plugin{
+		Name: "iter",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			ctx.EffectIter("iter", func(yield func(cordis.Dispose)) {
+				yield(func() { seq = append(seq, "d1") })
+				yield(func() { seq = append(seq, "d2") })
+				panic("boom")
+			})
+			return nil
+		},
+	}
+
+	var f *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f, err = ctx.Plugin(p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if fmt.Sprint(seq) != fmt.Sprint([]string{"d2", "d1"}) {
+		t.Fatalf("yielded disposables: %v, want LIFO [d2 d1]", seq)
+	}
+	if f.State() != cordis.StateFailed {
+		t.Fatalf("fiber state: %v, want failed", f.State())
+	}
+
+	// 正常注册的部分不受影响：全局卸载仍按 LIFO 回收。
+	//（创建与注销分两次 settle，否则注销发生在加载之前，效果根本没登记。）
+	seq = nil
+	p2 := &cordis.Plugin{
+		Name: "iter2",
+		Apply: func(ctx *cordis.Context, _ any) error {
+			ctx.EffectIter("iter", func(yield func(cordis.Dispose)) {
+				yield(func() { seq = append(seq, "a") })
+				yield(func() { seq = append(seq, "b") })
+			})
+			return nil
+		},
+	}
+	var f2 *cordis.Fiber
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		f2, err = ctx.Plugin(p2, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	h.run(func(*cordis.Context) { f2.Dispose() })
+	if fmt.Sprint(seq) != fmt.Sprint([]string{"b", "a"}) {
+		t.Fatalf("normal unload order: %v", seq)
+	}
+}
+
+// TestFailedFiberDoesNotReenterOnDependencyRefresh 加载失败后目标视图
+// 被冻结：依赖下线再上线（依赖刷新）不得把它重新拉进加载，只有
+// Update 清除错误才能恢复。
+func TestFailedFiberDoesNotReenterOnDependencyRefresh(t *testing.T) {
+	h := newHarness(t)
+	defer h.app.Close()
+
+	fail := true
+	var attempts int
+	p := &cordis.Plugin{
+		Name:   "flaky",
+		Inject: map[string]any{"db": nil},
+		Apply: func(*cordis.Context, any) error {
+			attempts++
+			if fail {
+				return errors.New("boom")
+			}
+			return nil
+		},
+	}
+
+	var (
+		f       *cordis.Fiber
+		dispose cordis.Dispose
+	)
+	h.run(func(ctx *cordis.Context) {
+		var err error
+		dispose, err = ctx.Provide("db", 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err = ctx.Plugin(p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if attempts != 1 || f.State() != cordis.StateFailed {
+		t.Fatalf("baseline: attempts=%d state=%v", attempts, f.State())
+	}
+
+	// 依赖下线 → 依赖者已在 FAILED，冻结不动。
+	h.run(func(*cordis.Context) { dispose() })
+	// 依赖回来 → 仍不得重入。
+	h.run(func(ctx *cordis.Context) {
+		if _, err := ctx.Provide("db", 2, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if attempts != 1 {
+		t.Fatalf("failed fiber re-entered on dependency refresh: attempts=%d", attempts)
+	}
+	if f.State() != cordis.StateFailed {
+		t.Fatalf("state after dependency churn: %v, want failed", f.State())
+	}
+
+	// Update 清除错误后恢复。
+	fail = false
+	h.run(func(_ *cordis.Context) {
+		if err := f.Update(nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if attempts != 2 || f.State() != cordis.StateActive {
+		t.Fatalf("recovery failed: attempts=%d state=%v", attempts, f.State())
+	}
 }
 
 // BenchmarkServiceNotify 度量服务上下线通知的代价：1000 个未声明

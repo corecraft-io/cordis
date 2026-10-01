@@ -439,14 +439,29 @@ func (f *Fiber) Effect(label string, execute func() (Dispose, error)) (Dispose, 
 
 // EffectIter 增量效果：iter 通过 yield 依次登记多个清理函数，
 // 全部按 LIFO 逆序撤销。对应官方实现的 generator effect 形态。
+//
+// iter 中途 panic 时，**已 yield 的部分立即逆序回收**，panic 继续
+// 向上抛（官方实现对生成器抛错的同一处理：`catch { dispose(); throw }`）。
+// 不这样做的话，那些已经生效的副作用就再也无人认领——effectStep
+// 尚未登记它们，fiber 的撤销链里根本没有它们的位置。
 func (f *Fiber) EffectIter(label string, iter func(yield func(Dispose))) Dispose {
 	d, _ := f.effectStep(label, func() (disposeStep, error) {
 		var disposables []Dispose
+		failed := true
+		defer func() {
+			if !failed {
+				return
+			}
+			for i := len(disposables) - 1; i >= 0; i-- {
+				f.safeDispose(label, disposables[i])
+			}
+		}()
 		iter(func(d Dispose) {
 			if d != nil {
 				disposables = append(disposables, d)
 			}
 		})
+		failed = false
 		if len(disposables) == 0 {
 			return disposeStep{}, nil
 		}

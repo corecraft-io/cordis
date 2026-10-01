@@ -5,7 +5,7 @@
 **English** · [中文](README.zh-CN.md)
 
 > A pure Go implementation of the **spatiotemporal composability** component model from *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)*.
-> Zero third-party dependencies · single-goroutine lock-free runtime · 57 tests green (incl. `-race`) · Apache-2.0
+> Zero third-party dependencies · single-goroutine lock-free runtime · 65 tests green (incl. `-race`) · Apache-2.0
 
 ---
 
@@ -36,6 +36,20 @@ In one sentence: **you declare only what you need and how to create it; the runt
 | declarative config | loader | `Loader` | `Entry` / `EntryGroup` / `EntryTree` plus the reconciliation algorithm |
 
 The table maps every concept of the paper and the official TypeScript implementation onto its counterpart here, so the two can be read side by side. The right-hand column records what the Go type actually holds, and the notes flag the semantics that matter when porting.
+
+### Deliberate Divergences
+
+Places where this implementation knowingly does **not** mirror the official one, with the reason and the test that pins the behaviour:
+
+| Aspect | Official TS | Here | Why |
+| --- | --- | --- | --- |
+| `fiber.update` error reporting | `async`: a failed reload rejects to the caller | `Update` returns immediately; reload failures surface through `Err()` / `State() == failed` | the caller usually already runs inside the single scheduler goroutine and cannot block on its own reload (`TestUpdateReportsReloadFailureAsynchronously` pins this) |
+| dependency notification | full scan over every runtime × fiber | reverse index keyed by isolate realm (`Reflect.index`) — the `filter` parameter was deleted on purpose | the full scan measured O(N²) at 10k tenants in insula; a custom route rule means building a second index, not re-adding a filter |
+| event names | string or symbol | string only | Go maps have no prototype chain, so the `__proto__` / `toString` hazards the upstream suite guards against cannot occur at all |
+| service access | `Context` is a Proxy; `Service` base class, `accessor` / `mixin`, callable services, `shadow` / traceable receivers | plain structs and methods; `Get` / `Provide` / `Intercept` cover the same ground | the Proxy layer exists to make `ctx.foo` a property read in JS; Go resolves services explicitly. The upstream `associate` / `shadow` / `invoke` suites are therefore N/A rather than missing |
+| effects | may be async (`Promise`, async generators); dispose is awaitable | synchronous `Dispose`; async cleanup is the two-phase `disposeStep{run, wait}`, and `Wait()` reports convergence | same reason — one scheduler goroutine, no promise machinery |
+| config validation | Standard Schema (`~standard.validate`) | `Plugin.Validate func(any) (any, error)` | no Standard Schema in Go; the error contract (structural vs config failure) is preserved |
+| `@Inject` decorator | class method decorator | N/A | Go has no decorators; `Plugin.Inject` and `ctx.Inject` express the same thing |
 
 ---
 
@@ -70,19 +84,20 @@ Three layers, matching the diagram:
 | --- | --- | --- |
 | `cordis.go` | 97 | Package doc, `FiberState`, error values, `Plugin` |
 | `app.go` | 225 | `App` host, scheduler, `Wait` / `Close` |
-| `context.go` | 210 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
-| `fiber.go` | 628 | State machine, epoch chasing, effects and LIFO disposal, local update hooks, hot config update |
+| `context.go` | 257 | Unified context, `Isolate` / `Intercept` derivation, `Get` / `Provide` facade |
+| `fiber.go` | 643 | State machine, epoch chasing, effects and LIFO disposal, local update hooks, hot config update |
 | `reflect.go` | 294 | Coeffect store, realm key resolution, reverse dependency index and notifications |
 | `registry.go` | 213 | `Plugin → Runtime` mapping, `Plugin` / `PluginInject` / `Inject` instantiation entry points |
-| `events.go` | 337 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`), listener routing, `Logger` |
+| `events.go` | 339 | Event bus (`Emit` / `Serial` / `Bail` / `Parallel` / `Waterfall`), listener routing, `Logger` |
 | `disposable.go` | 72 | Two-phase dispose steps and the order-preserving list |
 | `loader.go` | 785 | Declarative configuration layer: `EntryOptions` / `Entry` / `EntryGroup` / `EntryTree` / `Loader` |
 | `example/main.go` | 174 | End-to-end example covering hot reload, degradation and isolation |
-| `cordis_test.go` | 1576 | Core runtime tests (33 + 1 benchmark) |
-| `loader_test.go` | 707 | Loader tests (15 + 1 benchmark) |
+| `cordis_test.go` | 1832 | Core runtime tests (37 + 1 benchmark) |
+| `loader_test.go` | 887 | Loader tests (17 + 1 benchmark) |
 | `index_internal_test.go` | 411 | Reverse index lifecycle invariants (white-box) |
 | `disposable_internal_test.go` | 125 | Tombstone compaction invariants and benchmarks (1 + 3, white-box) |
 | `registry_internal_test.go` | 145 | `Runtime` add/remove consistency (white-box) |
+| `events_internal_test.go` | 127 | Event bucket lifecycle and listener-leak snapshots (2, white-box) |
 
 ---
 
@@ -92,7 +107,7 @@ Three layers, matching the diagram:
 git clone https://github.com/corecraft-io/cordis.git
 cd cordis
 
-go test ./...          # 57 tests
+go test ./...          # 65 tests
 go test -race ./...    # race detector
 go vet ./...
 go run ./example       # end-to-end demo
@@ -194,6 +209,8 @@ The third argument of `Provide`, `check func() bool`, expresses "the service exi
 ctx.Isolate("database", "tenant-a")   // shared within the realm, invisible across realms
 ctx.Intercept("database", myConfig)   // intercept config read by the provider
 ```
+
+Intercept config is resolved by `ctx.InterceptOf(name)`, which **merges the whole context chain, farthest to nearest** (the upstream `Service[resolveConfig]` behaviour): two `map[string]any` layers merge key by key with the nearer layer winning, and any non-map layer replaces outright (there are no keys to merge). The result is always a fresh map, so a provider that mutates its config cannot corrupt the declaration.
 
 Declared at the loader layer through `EntryOptions.Isolate`: `true` means a realm private to that entry (key `#entryID`), while a string means a shared realm (key `@label`).
 
@@ -373,11 +390,11 @@ stateDiagram-v2
 
 ## 10. Test Coverage
 
-`go test ./...` → **57 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
+`go test ./...` → **65 tests pass**; `go test -race ./...` reports no races; plus 5 benchmarks (`-bench .`).
 
 CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared in `go.mod`) and **stable**: `gofmt -l` must be clean, then `go vet`, `go build`, `go test -race`, the benchmarks, and an example smoke run.
 
-**Core runtime (`cordis_test.go`, 33 tests)**
+**Core runtime (`cordis_test.go`, 37 tests)**
 
 | Test | Coverage |
 | --- | --- |
@@ -410,8 +427,12 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestUpdateHookNoSaveAndVeto` | `noSave` reaches hooks; returning `false` vetoes config replacement and restart |
 | `TestUpdateHookDuplicateNextIsReported` | a hook misusing `next` yields an error from `Update` instead of killing the scheduler |
 | `TestInternalListenerTakesOver` | `internal/listener` can take over a registration and own its disposal |
+| `TestInterceptChainMerges` | intercept config merges along the context chain (nearer layer wins per key); the result never aliases a declaration |
+| `TestUpdateReportsReloadFailureAsynchronously` | pins the deliberate divergence: reload failures are **not** synchronous, validation errors are |
+| `TestEffectIterPanicReclaimsYielded` | a panic inside `iter` reclaims everything already yielded, in LIFO order, and still propagates |
+| `TestFailedFiberDoesNotReenterOnDependencyRefresh` | a failed fiber stays frozen through dependency churn; only `Update` recovers it |
 
-**Loader (`loader_test.go`, 15 tests)**
+**Loader (`loader_test.go`, 17 tests)**
 
 | Test | Coverage |
 | --- | --- |
@@ -423,6 +444,8 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 | `TestLoaderConfigErrorRecovery` | recovery in place after a validation failure |
 | `TestLoaderCommitHook` / `TestLoaderSelfDispose` | commit hook, self-dispose |
 | `TestLoaderLargeLoad` | 1100 entries in one load without deadlock |
+| `TestLoaderIsolateMigration` | adding/removing `isolate` on either side (relevant vs irrelevant service names, shared-realm references) is equivalent to teardown + rebuild |
+| `TestLoaderIsolateTransfer` | a cross-group move keeps the realm identity intact |
 
 **Internal invariants (white-box)**
 
@@ -431,6 +454,8 @@ CI (`.github/workflows/ci.yml`) runs on both **Go 1.22.x** (the minimum declared
 `TestDisposableCompactionPreservesOrder` (`disposable_internal_test.go`) — compaction actually fires (`order > 8` and `order > 2× live`), and the sort-based rebuild preserves LIFO order.
 
 `TestRuntimeRemoveConsistency` / `TestRuntimeRemoveThroughDispose` (`registry_internal_test.go`) — `Runtime.fibers` / `Runtime.index` stay consistent through out-of-order disposal (the O(1) swap-remove path from ADR-0007), and a cascading `Close` empties both.
+
+`TestEventBucketLifecycle` / `TestEventListenerNoLeakAcrossPluginTeardown` (`events_internal_test.go`) — an emptied bucket is deleted rather than left behind with `len == 0`, and tearing down plugin instances restores the exact bucket snapshot (the upstream `getHookSnapshot` comparison).
 
 **Benchmarks**
 
