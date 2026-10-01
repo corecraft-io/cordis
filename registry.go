@@ -9,20 +9,39 @@ import "fmt"
 type Runtime struct {
 	plugin *Plugin
 	fibers []*Fiber
+	// index 把 Fiber 指针映射到其在 fibers 中的位置，使 remove 为 O(1)。
+	// Runtime 以 Plugin 为键，单实例的 fibers 承载整个 App 内该插件
+	// 的全部实例（insula 下单分片可达数千），线性扫描 + 整尾拼接曾
+	// 是注销路径的主成本（ADR-0007 第 2 处退化）。
+	index map[*Fiber]int
 }
 
 func (rt *Runtime) add(f *Fiber) func() {
+	if rt.index == nil {
+		rt.index = make(map[*Fiber]int, len(rt.fibers)+1)
+	}
+	rt.index[f] = len(rt.fibers)
 	rt.fibers = append(rt.fibers, f)
 	return func() { rt.remove(f) }
 }
 
 func (rt *Runtime) remove(f *Fiber) {
-	for i, cur := range rt.fibers {
-		if cur == f {
-			rt.fibers = append(rt.fibers[:i], rt.fibers[i+1:]...)
-			return
-		}
+	i, ok := rt.index[f]
+	if !ok {
+		return
 	}
+	delete(rt.index, f)
+	last := len(rt.fibers) - 1
+	if i != last {
+		// 与末尾交换而非整尾复制：删除由 O(N) 降为 O(1)。
+		// 顺序不再是插入序，但 fibers 的读者（settled 稳定性检查、
+		// Registry.Delete 全量注销）都只关心成员而非次序。
+		moved := rt.fibers[last]
+		rt.fibers[i] = moved
+		rt.index[moved] = i
+	}
+	rt.fibers[last] = nil
+	rt.fibers = rt.fibers[:last]
 }
 
 // Registry 插件注册表：管理 Plugin → Runtime 映射，
